@@ -119,6 +119,9 @@ docker run -d --name funasr-realtime \
 | `ASR_MAX_CONCURRENT_UPLOADS` | 网关同时接收并写入临时文件的上传数量上限，范围为 1–1024。达到上限时，新请求会在读取请求体之前返回 `429`。 | `2` |
 | `ASR_MAX_CONCURRENT_TRANSCRIPTIONS` | 不同模型之间同时执行转写任务的全局上限，范围为 1–1024。同一模型固定使用单 worker 串行执行，因此实际并发数不会超过已启用的离线模型数量；其余任务在对应模型队列中等待。 | `2` |
 | `ASR_MAX_STORED_AUDIO_SIZE_MIB` | 正在上传、排队中和运行中任务的临时音频文件总容量上限（MiB），范围为 1–1048576。达到上限时，新任务返回 `429`。 | `512` |
+| `ASR_RECOMMENDED_SEGMENT_DURATION_SECONDS` | 公布给调用端的推荐音频核心分片长度（秒）。 | `1800` |
+| `ASR_SEGMENT_OVERLAP_SECONDS` | 公布给调用端的分片前后重叠长度（秒），必须小于核心分片长度。 | `2` |
+| `ASR_TRANSCRIPTION_TIMEOUT_SECONDS` | 单个任务从 worker 开始执行后的超时（秒），不包含上传和排队时间。 | `1800` |
 
 > **重要约束**：
 > - `ASR_ENABLE_WHISPERX` 和 `ASR_ENABLE_FUNASR` 不能同时为 `false`。网关启动时必须至少有一个引擎处于启用状态，否则会报错并拒绝启动。
@@ -198,6 +201,8 @@ curl http://localhost:8080/v1/system \
   -H "Authorization: Bearer change-me"
 ```
 *提示：如果禁用了某个引擎，对应的 `upstream_status` 在返回中会被标记为 `"disabled"`，且网关不会向上游发送检测请求，保障了单体部署时的稳定性。*
+
+响应中的 `transcription_policy` 会公布推荐分片长度、重叠长度和单片执行超时。长媒体调用方应在本地提取视频音轨并按此策略分片，避免将原始视频上传到网关。单片执行超时后，网关会取消上游推理、清理任务资源并继续处理同模型队列中的下一个任务。
 
 ### 3. 转写接口调用测试
 上传音频并使用已启用的模型进行识别：

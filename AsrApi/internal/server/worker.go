@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"time"
 )
 
 func (s *service) startQueueWorkers(tm *TaskManager) {
@@ -103,6 +104,9 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 		}
 	}
 
+	executionContext, cancelExecution := context.WithTimeout(task.Ctx, s.configuredTranscriptionTimeout())
+	defer cancelExecution()
+
 	modelForUpstream := backend.model
 	if task.Level != "" {
 		modelForUpstream = task.Level
@@ -120,7 +124,7 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 
 	body, contentType := buildUpstreamBody(file, task.Filename, modelForUpstream, task.Language, task.ResponseFormat)
 
-	request, err := http.NewRequestWithContext(task.Ctx, http.MethodPost, backend.url+"/v1/audio/transcriptions", body)
+	request, err := http.NewRequestWithContext(executionContext, http.MethodPost, backend.url+"/v1/audio/transcriptions", body)
 	if err != nil {
 		return ASRTaskResult{
 			StatusCode: http.StatusInternalServerError,
@@ -135,6 +139,14 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 	log.Printf("[Queue] Sending HTTP post request to %s upstream for task %s", task.Model, task.ID)
 	response, err := s.client.Do(request)
 	if err != nil {
+		if errors.Is(executionContext.Err(), context.DeadlineExceeded) {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+			return ASRTaskResult{
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       []byte(`{"error":"transcription execution timed out"}`),
+				Err:        context.DeadlineExceeded,
+			}
+		}
 		if task.Ctx.Err() == nil {
 			s.cancelUpstreamAfterRequestFailure(task, backend)
 		}
@@ -160,6 +172,27 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 		Body:       respBody,
 		Header:     response.Header,
 	}
+}
+
+func (s *service) configuredSegmentDuration() time.Duration {
+	if s.segmentDuration > 0 {
+		return s.segmentDuration
+	}
+	return defaultSegmentDurationSeconds * time.Second
+}
+
+func (s *service) configuredSegmentOverlap() time.Duration {
+	if s.segmentOverlap > 0 {
+		return s.segmentOverlap
+	}
+	return defaultSegmentOverlapSeconds * time.Second
+}
+
+func (s *service) configuredTranscriptionTimeout() time.Duration {
+	if s.transcriptionTimeout > 0 {
+		return s.transcriptionTimeout
+	}
+	return defaultTranscriptionTimeoutSeconds * time.Second
 }
 
 func (s *service) cancelUpstreamAfterRequestFailure(task *ASRTask, backend upstream) {

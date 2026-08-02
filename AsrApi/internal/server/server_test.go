@@ -1032,6 +1032,78 @@ func TestProcessTaskCancelsUpstreamAfterTransportFailure(t *testing.T) {
 	}
 }
 
+func TestQueueWorkerContinuesAfterTranscriptionTimeout(t *testing.T) {
+	const timedOutTaskID = "timed-out-task"
+	const nextTaskID = "next-task"
+	cancelledTaskID := make(chan string, 1)
+	releaseTimedOutRequest := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseTimedOutRequest)
+		})
+	})
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if request.Header.Get("X-Task-Id") == timedOutTaskID {
+			<-releaseTimedOutRequest
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if _, err := writer.Write([]byte(`{"text":"ok"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	manager := NewTaskManager(2, maxAudioFileSize, models)
+	server := &service{
+		upstreams:            models,
+		client:               &http.Client{},
+		statusClient:         &http.Client{Timeout: time.Second},
+		transcriptionTimeout: 50 * time.Millisecond,
+		taskManager:          manager,
+		transcribeSem:        make(chan struct{}, 1),
+	}
+	server.startQueueWorkers(manager)
+
+	timedOutTask := testTask(timedOutTaskID, "whisperx", writeTestAudio(t, "timed-out.wav"))
+	nextTask := testTask(nextTaskID, "whisperx", writeTestAudio(t, "next.wav"))
+	if err := manager.Add(timedOutTask); err != nil {
+		t.Fatalf("add timed out task: %v", err)
+	}
+	if err := manager.Add(nextTask); err != nil {
+		t.Fatalf("add next task: %v", err)
+	}
+
+	result := <-timedOutTask.ResultChan
+	if result.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, result.StatusCode)
+	}
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", result.Err)
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != timedOutTaskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", timedOutTaskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+	waitForTaskResult(t, nextTask)
+	releaseOnce.Do(func() {
+		close(releaseTimedOutRequest)
+	})
+}
+
 func TestTransportFailureAndExternalCancellationShareUpstreamRequest(t *testing.T) {
 	const taskID = "shared-transport-failure"
 	cancelRequests := make(chan struct{}, 2)
@@ -1302,6 +1374,15 @@ func TestLoadServiceEnvironmentValidAndDefaults(t *testing.T) {
 	if env.maxConcurrentUploads != 5 {
 		t.Fatalf("expected maxConcurrentUploads=5, got %d", env.maxConcurrentUploads)
 	}
+	if env.segmentDurationSeconds != defaultSegmentDurationSeconds {
+		t.Fatalf("expected default segment duration %d, got %d", defaultSegmentDurationSeconds, env.segmentDurationSeconds)
+	}
+	if env.segmentOverlapSeconds != defaultSegmentOverlapSeconds {
+		t.Fatalf("expected default segment overlap %d, got %d", defaultSegmentOverlapSeconds, env.segmentOverlapSeconds)
+	}
+	if env.transcriptionTimeoutSeconds != defaultTranscriptionTimeoutSeconds {
+		t.Fatalf("expected default transcription timeout %d, got %d", defaultTranscriptionTimeoutSeconds, env.transcriptionTimeoutSeconds)
+	}
 }
 
 func TestLoadServiceEnvironmentRejectsInvalidValues(t *testing.T) {
@@ -1316,6 +1397,14 @@ func TestLoadServiceEnvironmentRejectsInvalidValues(t *testing.T) {
 		t.Setenv("ASR_MAX_CONCURRENT_UPLOADS", "2000")
 		if _, err := loadServiceEnvironment(); err == nil {
 			t.Fatal("expected error for int exceeding max limit")
+		}
+	})
+
+	t.Run("overlap_not_less_than_segment", func(t *testing.T) {
+		t.Setenv("ASR_RECOMMENDED_SEGMENT_DURATION_SECONDS", "10")
+		t.Setenv("ASR_SEGMENT_OVERLAP_SECONDS", "10")
+		if _, err := loadServiceEnvironment(); err == nil {
+			t.Fatal("expected overlap equal to segment duration to be rejected")
 		}
 	})
 }
@@ -1438,8 +1527,11 @@ func TestSystemEndpoint(t *testing.T) {
 	defer upstreamServer.Close()
 
 	svc := &service{
-		whisperxEnabled: true,
-		funasrEnabled:   false,
+		whisperxEnabled:      true,
+		funasrEnabled:        false,
+		segmentDuration:      20 * time.Minute,
+		segmentOverlap:       3 * time.Second,
+		transcriptionTimeout: 25 * time.Minute,
 		upstreams: map[string]upstream{
 			"whisperx": {url: upstreamServer.URL, token: "token"},
 		},
@@ -1457,6 +1549,15 @@ func TestSystemEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"upstream_status":"available"`) {
 		t.Fatalf("unexpected system response: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"recommended_segment_duration_seconds":1200`) {
+		t.Fatalf("expected segment duration policy in response: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"segment_overlap_seconds":3`) {
+		t.Fatalf("expected segment overlap policy in response: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"transcription_timeout_seconds":1500`) {
+		t.Fatalf("expected transcription timeout policy in response: %s", recorder.Body.String())
 	}
 }
 
@@ -1962,6 +2063,3 @@ func TestTaskManagerReserveStorageAndPublishResult(t *testing.T) {
 	task.ResultChan <- ASRTaskResult{StatusCode: 200}
 	publishTaskResult(task, ASRTaskResult{StatusCode: 500})
 }
-
-
-

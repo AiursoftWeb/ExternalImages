@@ -11,18 +11,22 @@ import (
 )
 
 const (
-	maxAudioFileSize              = 100 << 20
-	maxUploadRequestOverhead      = 1 << 20
-	maxTranscriptionFormFieldSize = 4 << 10
-	maxCancelRequestSize          = 4 << 10
-	maxTaskIDLength               = 128
-	defaultMaxStoredAudioSizeMiB  = 512
-	maxConfiguredStoredAudioMiB   = 1 << 20
-	maxConfiguredConcurrency      = 1024
-	maxCancelTombstones           = 1024
-	cancelTombstoneTTL            = 10 * time.Minute
-	cancelUpstreamTimeout         = 12 * time.Second
-	cancelTaskCleanupTimeout      = 12 * time.Second
+	maxAudioFileSize                   = 100 << 20
+	maxUploadRequestOverhead           = 1 << 20
+	maxTranscriptionFormFieldSize      = 4 << 10
+	maxCancelRequestSize               = 4 << 10
+	maxTaskIDLength                    = 128
+	defaultMaxStoredAudioSizeMiB       = 512
+	maxConfiguredStoredAudioMiB        = 1 << 20
+	maxConfiguredConcurrency           = 1024
+	defaultSegmentDurationSeconds      = 30 * 60
+	defaultSegmentOverlapSeconds       = 2
+	defaultTranscriptionTimeoutSeconds = 30 * 60
+	maxConfiguredDurationSeconds       = 24 * 60 * 60
+	maxCancelTombstones                = 1024
+	cancelTombstoneTTL                 = 10 * time.Minute
+	cancelUpstreamTimeout              = 12 * time.Second
+	cancelTaskCleanupTimeout           = 12 * time.Second
 )
 
 var (
