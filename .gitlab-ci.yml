@@ -3,6 +3,7 @@ stages:
 
 .deploy_template:
   stage: deploy
+  timeout: 6 hours
   variables:
     PLATFORMS: "linux/amd64,linux/arm64"
     BUILD_ARGS: ""
