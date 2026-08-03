@@ -366,7 +366,7 @@ func (s *service) cancelTask(c *gin.Context) {
 		return
 	}
 
-	found, err := s.taskManager.CancelAndWait(id, s.cancelTaskForModel, cancelTaskCleanupTimeout)
+	found, err := s.taskManager.CancelAndWaitOrReserve(id, s.cancelTaskForModel, cancelTaskCleanupTimeout)
 	if !found {
 		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("task %s not found or already completed", id)})
 		return

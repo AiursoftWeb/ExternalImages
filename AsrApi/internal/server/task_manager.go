@@ -258,6 +258,25 @@ func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, t
 	}
 }
 
+func (tm *TaskManager) CancelAndWaitOrReserve(id string, cancelUpstreamFunc func(model, taskID string) error, cleanupTimeout time.Duration) (bool, error) {
+	for {
+		found, err := tm.CancelAndWait(id, cancelUpstreamFunc, cleanupTimeout)
+		if found || err != nil {
+			return found, err
+		}
+
+		tm.mu.Lock()
+		tm.pruneCancelledTaskIDs(time.Now())
+		if _, exists := tm.tasks[id]; exists {
+			tm.mu.Unlock()
+			continue
+		}
+		tm.recordCancelledTaskID(id, "", false, time.Now())
+		tm.mu.Unlock()
+		return true, nil
+	}
+}
+
 func (tm *TaskManager) retryCancellation(id string, record cancellationRecord, attempt *cancellationAttempt, cancelUpstreamFunc func(model, taskID string) error) (bool, error) {
 	var cancelErr error
 	if cancelUpstreamFunc != nil {

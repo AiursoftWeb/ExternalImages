@@ -611,6 +611,28 @@ func TestCancelUnknownTaskDoesNotCallUpstream(t *testing.T) {
 	}
 }
 
+func TestCancelAndWaitOrReserveRejectsLateTask(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	cancelCalled := false
+
+	found, err := manager.CancelAndWaitOrReserve("late-task", func(_, _ string) error {
+		cancelCalled = true
+		return nil
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("reserve cancellation for late task: %v", err)
+	}
+	if !found {
+		t.Fatal("expected late task cancellation to be reserved")
+	}
+	if cancelCalled {
+		t.Fatal("expected unknown task not to reach upstream cancellation")
+	}
+	if err := manager.Add(testTask("late-task", "whisperx", "")); err == nil {
+		t.Fatal("expected late task admission to be rejected")
+	}
+}
+
 func TestTranscribeRejectsUploadBeforeReadingBodyWhenAdmissionIsFull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	server := &service{uploadSem: make(chan struct{}, 1)}
@@ -1716,14 +1738,17 @@ func TestCancelTaskHandlerVariations(t *testing.T) {
 		}
 	})
 
-	t.Run("not_found", func(t *testing.T) {
+	t.Run("reserve_before_admission", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest(http.MethodPost, "/v1/tasks/cancel", nil)
 		c.Params = gin.Params{{Key: "id", Value: "nonexistent-task"}}
 		svc.cancelTask(c)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if err := svc.taskManager.Add(testTask("nonexistent-task", "whisperx", "")); err == nil {
+			t.Fatal("expected reserved task admission to be rejected")
 		}
 	})
 
