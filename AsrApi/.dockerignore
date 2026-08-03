@@ -1,0 +1,7 @@
+.git
+.gitignore
+README.md
+*_test.go
+.env
+web/node_modules
+web/dist

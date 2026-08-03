@@ -1,0 +1,81 @@
+stages:
+  - deploy
+
+.deploy_template:
+  stage: deploy
+  variables:
+    PLATFORMS: "linux/amd64,linux/arm64"
+    BUILD_ARGS: ""
+  before_script:
+    - if [[ "$CI_PROJECT_NAMESPACE" != "aiursoft" ]]; then
+        echo "CI pipeline will only run for the Aiursoft namespace.";
+        exit 1;
+      fi
+    - echo "Logging in to the home registry..."
+    - echo "$LOCAL_DOCKER_PASSWORD" | docker login hub.aiursoft.com -u "$LOCAL_DOCKER_USERNAME" --password-stdin
+    - echo "Logging in to Docker Hub..."
+    - echo "$DOCKER_PASSWORD" | docker login docker.io -u "$DOCKER_USERNAME" --password-stdin
+    - docker buildx use aiur-global-builder
+  script:
+    - if [[ "$CI_COMMIT_BRANCH" == "master" ]]; then TAG="latest"; else TAG="$CI_COMMIT_REF_SLUG"; fi
+    - INTERNAL_TARGET="hub.aiursoft.com/aiursoft/$IMAGE_NAME:$TAG"
+    - PUBLIC_TARGET="docker.io/aiursoft/$IMAGE_NAME:$TAG"
+    - echo "Building $INTERNAL_TARGET and $PUBLIC_TARGET"
+    - docker buildx build $BUILD_ARGS "$CONTEXT" --platform "$PLATFORMS" -t "$INTERNAL_TARGET" -t "$PUBLIC_TARGET" --push
+
+deploy_gateway:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "gateway"
+    CONTEXT: "./Gateway"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - Gateway/**/*
+
+deploy_asr_api:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "asr-api"
+    CONTEXT: "./AsrApi"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - AsrApi/**/*
+
+deploy_folder_agent:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "folderagent"
+    CONTEXT: "./FolderAgent"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - FolderAgent/**/*
+
+deploy_markitdown:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "markitdown"
+    CONTEXT: "./MarkItDown"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - MarkItDown/**/*
+
+deploy_whisperx:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "whisperx"
+    CONTEXT: "./WhisperX"
+    PLATFORMS: "linux/amd64"
+    BUILD_ARGS: "--build-arg SINGLE_MODEL=true --build-arg USE_PYPI_MIRROR=true"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - WhisperX/**/*
