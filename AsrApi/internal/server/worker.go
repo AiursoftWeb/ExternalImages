@@ -174,20 +174,6 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 	}
 }
 
-func (s *service) configuredSegmentDuration() time.Duration {
-	if s.segmentDuration > 0 {
-		return s.segmentDuration
-	}
-	return defaultSegmentDurationSeconds * time.Second
-}
-
-func (s *service) configuredSegmentOverlap() time.Duration {
-	if s.segmentOverlap > 0 {
-		return s.segmentOverlap
-	}
-	return defaultSegmentOverlapSeconds * time.Second
-}
-
 func (s *service) configuredTranscriptionTimeout() time.Duration {
 	if s.transcriptionTimeout > 0 {
 		return s.transcriptionTimeout

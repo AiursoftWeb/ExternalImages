@@ -49,6 +49,7 @@ const theme = createTheme({
 })
 
 const taskStorageKey = 'asr-api-demo-tasks'
+const maxAudioFileSize = 1024 * 1024 * 1024
 
 function loadTasks() {
   try {
@@ -295,6 +296,10 @@ function App() {
   async function transcribe() {
     if (!file || !token) {
       setError('请选择音频文件并填写 API Token。')
+      return
+    }
+    if (file.size > maxAudioFileSize) {
+      setError('单个音频文件不能超过 1 GiB。长音频请先由调用方分片。')
       return
     }
 
@@ -572,7 +577,7 @@ function App() {
                   <Button component="label" variant="outlined" color="primary" startIcon={<CloudUploadOutlinedIcon />} sx={{ minHeight: 88, borderStyle: 'dashed', justifyContent: 'flex-start', px: 3, textTransform: 'none' }}>
                     <Box textAlign="left">
                       <Typography fontWeight={600}>{file ? file.name : '选择音频文件'}</Typography>
-                      <Typography variant="body2" color="text.secondary">支持服务端接受的音频格式，音频文件上限 100 MiB</Typography>
+                      <Typography variant="body2" color="text.secondary">支持服务端接受的音频格式，单个音频文件上限 1 GiB；长音频请由调用方自行分片</Typography>
                     </Box>
                     <input hidden type="file" accept="audio/*" onChange={(event) => setFile(event.target.files?.[0] || null)} />
                   </Button>
@@ -721,7 +726,7 @@ function App() {
                 <ApiEndpoint method="GET" path="/v1/models" description="获取可用的语音识别模型列表。" example={'curl http://localhost:8080/v1/models \\\n  -H "Authorization: Bearer <ASR_API_TOKEN>"'} />
                 <ApiEndpoint method="GET" path="/v1/system" description="获取网关及上游模型服务的运行状态。" example={'curl http://localhost:8080/v1/system \\\n  -H "Authorization: Bearer <ASR_API_TOKEN>"'} />
                 <ApiEndpoint method="POST" path="/v1/tasks/:id/cancel" description="取消指定的排队中或运行中的语音识别任务。" example={'curl -X POST http://localhost:8080/v1/tasks/task_123456_000000/cancel \\\n  -H "Authorization: Bearer <ASR_API_TOKEN>"'} />
-                <ApiEndpoint method="POST" path="/v1/audio/transcriptions" description="上传音频并使用指定模型与档位返回转写结果。level 可选，省略时使用该引擎默认档。" example={
+                <ApiEndpoint method="POST" path="/v1/audio/transcriptions" description="上传不超过 1 GiB 的音频并使用指定模型与档位返回转写结果。长音频的分片与结果合并由调用方负责；level 可选，省略时使用该引擎默认档。" example={
                   (config.funasr && config.whisperx) ?
                   `# FunASR：默认档 sensevoice，可指定 paraformer / paraformer-en\ncurl http://localhost:8080/v1/audio/transcriptions \\\n  -H "Authorization: Bearer <ASR_API_TOKEN>" \\\n  -F file=@meeting.wav \\\n  -F model=funasr \\\n  -F level=paraformer\n\n# WhisperX：默认档 large-v3，已烘焙 ${whisperxBakedStr}\ncurl http://localhost:8080/v1/audio/transcriptions \\\n  -H "Authorization: Bearer <ASR_API_TOKEN>" \\\n  -F file=@meeting.wav \\\n  -F model=whisperx \\\n  -F level=large-v3\n\n# 省略 -F level 即使用引擎默认档`
                   : config.funasr ?

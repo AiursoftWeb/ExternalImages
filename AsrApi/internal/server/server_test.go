@@ -702,7 +702,7 @@ func TestTranscriptionUploadErrorResponseReturnsRequestEntityTooLarge(t *testing
 	if statusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, statusCode)
 	}
-	if message != "audio file exceeds 100 MiB limit" {
+	if message != "audio file exceeds 1024 MiB limit" {
 		t.Fatalf("unexpected oversized upload message %q", message)
 	}
 }
@@ -1374,12 +1374,6 @@ func TestLoadServiceEnvironmentValidAndDefaults(t *testing.T) {
 	if env.maxConcurrentUploads != 5 {
 		t.Fatalf("expected maxConcurrentUploads=5, got %d", env.maxConcurrentUploads)
 	}
-	if env.segmentDurationSeconds != defaultSegmentDurationSeconds {
-		t.Fatalf("expected default segment duration %d, got %d", defaultSegmentDurationSeconds, env.segmentDurationSeconds)
-	}
-	if env.segmentOverlapSeconds != defaultSegmentOverlapSeconds {
-		t.Fatalf("expected default segment overlap %d, got %d", defaultSegmentOverlapSeconds, env.segmentOverlapSeconds)
-	}
 	if env.transcriptionTimeoutSeconds != defaultTranscriptionTimeoutSeconds {
 		t.Fatalf("expected default transcription timeout %d, got %d", defaultTranscriptionTimeoutSeconds, env.transcriptionTimeoutSeconds)
 	}
@@ -1400,13 +1394,6 @@ func TestLoadServiceEnvironmentRejectsInvalidValues(t *testing.T) {
 		}
 	})
 
-	t.Run("overlap_not_less_than_segment", func(t *testing.T) {
-		t.Setenv("ASR_RECOMMENDED_SEGMENT_DURATION_SECONDS", "10")
-		t.Setenv("ASR_SEGMENT_OVERLAP_SECONDS", "10")
-		if _, err := loadServiceEnvironment(); err == nil {
-			t.Fatal("expected overlap equal to segment duration to be rejected")
-		}
-	})
 }
 
 func TestNewServiceFromEnvironmentValidation(t *testing.T) {
@@ -1529,8 +1516,6 @@ func TestSystemEndpoint(t *testing.T) {
 	svc := &service{
 		whisperxEnabled:      true,
 		funasrEnabled:        false,
-		segmentDuration:      20 * time.Minute,
-		segmentOverlap:       3 * time.Second,
 		transcriptionTimeout: 25 * time.Minute,
 		upstreams: map[string]upstream{
 			"whisperx": {url: upstreamServer.URL, token: "token"},
@@ -1550,14 +1535,9 @@ func TestSystemEndpoint(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"upstream_status":"available"`) {
 		t.Fatalf("unexpected system response: %s", recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), `"recommended_segment_duration_seconds":1200`) {
-		t.Fatalf("expected segment duration policy in response: %s", recorder.Body.String())
-	}
-	if !strings.Contains(recorder.Body.String(), `"segment_overlap_seconds":3`) {
-		t.Fatalf("expected segment overlap policy in response: %s", recorder.Body.String())
-	}
-	if !strings.Contains(recorder.Body.String(), `"transcription_timeout_seconds":1500`) {
-		t.Fatalf("expected transcription timeout policy in response: %s", recorder.Body.String())
+	if strings.Contains(recorder.Body.String(), "upload_limit_bytes") ||
+		strings.Contains(recorder.Body.String(), "transcription_policy") {
+		t.Fatalf("expected health-only system response: %s", recorder.Body.String())
 	}
 }
 

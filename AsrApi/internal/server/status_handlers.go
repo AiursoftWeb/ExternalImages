@@ -126,13 +126,7 @@ func (s *service) system(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":             "ok",
-		"upload_limit_bytes": maxAudioFileSize,
-		"transcription_policy": gin.H{
-			"recommended_segment_duration_seconds": int(s.configuredSegmentDuration().Seconds()),
-			"segment_overlap_seconds":              int(s.configuredSegmentOverlap().Seconds()),
-			"transcription_timeout_seconds":        int(s.configuredTranscriptionTimeout().Seconds()),
-		},
+		"status": "ok",
 		"models": modelsList,
 	})
 }

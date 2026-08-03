@@ -21,8 +21,6 @@ type service struct {
 	upstreams             map[string]upstream
 	client                *http.Client
 	statusClient          *http.Client
-	segmentDuration       time.Duration
-	segmentOverlap        time.Duration
 	transcriptionTimeout  time.Duration
 	whisperxEnabled       bool
 	funasrEnabled         bool
@@ -41,8 +39,6 @@ type serviceEnvironment struct {
 	maxStoredAudioSizeMiB       int
 	maxConcurrentUploads        int
 	maxConcurrentTranscriptions int
-	segmentDurationSeconds      int
-	segmentOverlapSeconds       int
 	transcriptionTimeoutSeconds int
 }
 
@@ -171,8 +167,6 @@ func newServiceFromEnvironment() (*service, error) {
 		upstreams:             upstreams,
 		client:                &http.Client{},
 		statusClient:          &http.Client{Timeout: cancelUpstreamTimeout},
-		segmentDuration:       time.Duration(settings.segmentDurationSeconds) * time.Second,
-		segmentOverlap:        time.Duration(settings.segmentOverlapSeconds) * time.Second,
 		transcriptionTimeout:  time.Duration(settings.transcriptionTimeoutSeconds) * time.Second,
 		whisperxEnabled:       settings.whisperxEnabled,
 		funasrEnabled:         settings.funasrEnabled,
@@ -224,15 +218,6 @@ func loadServiceEnvironment() (serviceEnvironment, error) {
 	}
 	if settings.maxConcurrentTranscriptions, err = environmentOrDefaultInt("ASR_MAX_CONCURRENT_TRANSCRIPTIONS", 2, maxConfiguredConcurrency); err != nil {
 		return serviceEnvironment{}, err
-	}
-	if settings.segmentDurationSeconds, err = environmentOrDefaultInt("ASR_RECOMMENDED_SEGMENT_DURATION_SECONDS", defaultSegmentDurationSeconds, maxConfiguredDurationSeconds); err != nil {
-		return serviceEnvironment{}, err
-	}
-	if settings.segmentOverlapSeconds, err = environmentOrDefaultInt("ASR_SEGMENT_OVERLAP_SECONDS", defaultSegmentOverlapSeconds, maxConfiguredDurationSeconds); err != nil {
-		return serviceEnvironment{}, err
-	}
-	if settings.segmentOverlapSeconds >= settings.segmentDurationSeconds {
-		return serviceEnvironment{}, errors.New("ASR_SEGMENT_OVERLAP_SECONDS must be less than ASR_RECOMMENDED_SEGMENT_DURATION_SECONDS")
 	}
 	if settings.transcriptionTimeoutSeconds, err = environmentOrDefaultInt("ASR_TRANSCRIPTION_TIMEOUT_SECONDS", defaultTranscriptionTimeoutSeconds, maxConfiguredDurationSeconds); err != nil {
 		return serviceEnvironment{}, err
