@@ -1896,6 +1896,40 @@ func TestTranscribeHandler_UploadValidationAndErrors(t *testing.T) {
 			t.Fatalf("expected 429 when upload sem full, got %d", rec.Code)
 		}
 	})
+
+	t.Run("queued_task_timeout", func(t *testing.T) {
+		models := map[string]upstream{"whisperx": {}}
+		manager := NewTaskManager(10, maxAudioFileSize, models)
+		svc := &service{
+			uploadSem:            make(chan struct{}, 1),
+			upstreams:            models,
+			taskManager:          manager,
+			transcriptionTimeout: 20 * time.Millisecond,
+		}
+		req := newMultipartTranscriptionRequest(t, "audio content", map[string]string{
+			"model":   "whisperx",
+			"task_id": "queued-timeout",
+		})
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = req
+
+		svc.transcribe(c)
+
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("expected 504 for queued task timeout, got %d", rec.Code)
+		}
+		manager.mu.RLock()
+		_, taskExists := manager.tasks["queued-timeout"]
+		storedBytes := manager.storedBytes
+		manager.mu.RUnlock()
+		if taskExists {
+			t.Fatal("expected timed out task to be removed")
+		}
+		if storedBytes != 0 {
+			t.Fatalf("expected timed out task storage to be released, got %d", storedBytes)
+		}
+	})
 }
 
 func TestUpstreamStatusAndSystemHandlerEdgeCases(t *testing.T) {

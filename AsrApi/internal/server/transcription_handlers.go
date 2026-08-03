@@ -140,6 +140,8 @@ func (s *service) transcribe(c *gin.Context) {
 
 	c.Header("X-Task-Id", task.ID)
 
+	taskTimer := time.NewTimer(s.configuredTranscriptionTimeout())
+	defer taskTimer.Stop()
 	select {
 	case result := <-task.ResultChan:
 		if result.Err != nil {
@@ -173,6 +175,12 @@ func (s *service) transcribe(c *gin.Context) {
 			log.Printf("[ASR API] Failed to confirm cancellation after client disconnected for task %s: %v", task.ID, err)
 		}
 		c.JSON(http.StatusRequestTimeout, gin.H{"error": "client disconnected"})
+	case <-taskTimer.C:
+		log.Printf("[ASR API] Task %s timed out while queued or running, triggering cancellation...", task.ID)
+		if _, err := s.taskManager.CancelAndWait(task.ID, s.cancelTaskForModel, cancelTaskCleanupTimeout); err != nil {
+			log.Printf("[ASR API] Failed to confirm cancellation after task timeout for %s: %v", task.ID, err)
+		}
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "transcription request timed out"})
 	}
 }
 
