@@ -260,21 +260,34 @@ func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, t
 
 func (tm *TaskManager) CancelAndWaitOrReserve(id string, cancelUpstreamFunc func(model, taskID string) error, cleanupTimeout time.Duration) (bool, error) {
 	for {
+		if tm.reserveCancellationIfTaskAbsent(id) {
+			return true, nil
+		}
+
 		found, err := tm.CancelAndWait(id, cancelUpstreamFunc, cleanupTimeout)
 		if found || err != nil {
 			return found, err
 		}
-
-		tm.mu.Lock()
-		tm.pruneCancelledTaskIDs(time.Now())
-		if _, exists := tm.tasks[id]; exists {
-			tm.mu.Unlock()
-			continue
-		}
-		tm.recordCancelledTaskID(id, "", false, time.Now())
-		tm.mu.Unlock()
-		return true, nil
 	}
+}
+
+func (tm *TaskManager) reserveCancellationIfTaskAbsent(id string) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.pruneCancelledTaskIDs(time.Now())
+	if _, exists := tm.tasks[id]; exists {
+		return false
+	}
+	if _, exists := tm.cancellationAttempts[id]; exists {
+		return false
+	}
+	if record, exists := tm.cancelledTaskIDs[id]; exists {
+		return !record.Retryable
+	}
+
+	tm.recordCancelledTaskID(id, "", false, time.Now())
+	return true
 }
 
 func (tm *TaskManager) retryCancellation(id string, record cancellationRecord, attempt *cancellationAttempt, cancelUpstreamFunc func(model, taskID string) error) (bool, error) {

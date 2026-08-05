@@ -633,6 +633,47 @@ func TestCancelAndWaitOrReserveRejectsLateTask(t *testing.T) {
 	}
 }
 
+func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("running-reserved-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, time.Second)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case <-task.ResultChan:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancellation result")
+	}
+	select {
+	case result := <-cancelled:
+		t.Fatalf("cancellation returned before task cleanup: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.completeTaskCleanup(task)
+	result := <-cancelled
+	if result.err != nil {
+		t.Fatalf("cancel and wait or reserve: %v", result.err)
+	}
+	if !result.found {
+		t.Fatal("expected running task cancellation to succeed")
+	}
+}
+
 func TestTranscribeRejectsUploadBeforeReadingBodyWhenAdmissionIsFull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	server := &service{uploadSem: make(chan struct{}, 1)}
