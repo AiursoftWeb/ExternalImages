@@ -674,6 +674,57 @@ func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
 	}
 }
 
+func TestCancelAndWaitStopsUploadingTaskAndRejectsQueueAdmission(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	ctx, cancel := context.WithCancel(context.Background())
+	body := newBlockingReadCloser()
+	task := &ASRTask{
+		ID:         "uploading-task",
+		Status:     StatusUploading,
+		Model:      "whisperx",
+		ResultChan: make(chan ASRTaskResult, 1),
+		Ctx:        ctx,
+		CancelFunc: cancel,
+		UploadBody: body,
+	}
+	if err := manager.BeginUpload(task); err != nil {
+		t.Fatalf("begin upload: %v", err)
+	}
+
+	server := &service{taskManager: manager}
+	copyResult := make(chan error, 1)
+	go func() {
+		err := server.copyAudioWithStorageReservation(io.Discard, body, task)
+		manager.completeTaskCleanup(task)
+		manager.AbortUpload(task)
+		copyResult <- err
+	}()
+	<-body.started
+
+	found, err := manager.CancelAndWait(task.ID, nil, time.Second)
+	if err != nil {
+		t.Fatalf("cancel uploading task: %v", err)
+	}
+	if !found {
+		t.Fatal("expected uploading task cancellation to succeed")
+	}
+	if err := <-copyResult; !errors.Is(err, errTaskCancelledDuringUpload) {
+		t.Fatalf("expected cancelled upload error, got %v", err)
+	}
+	if err := manager.CompleteUpload(task); !errors.Is(err, errTaskCancelledDuringUpload) {
+		t.Fatalf("expected cancelled upload queue admission to fail, got %v", err)
+	}
+	if manager.storedBytes != 0 {
+		t.Fatalf("expected cancelled upload storage to be released, got %d", manager.storedBytes)
+	}
+	manager.mu.RLock()
+	_, taskExists := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if taskExists {
+		t.Fatal("expected cancelled upload registration to be removed after cleanup")
+	}
+}
+
 func TestTranscribeRejectsUploadBeforeReadingBodyWhenAdmissionIsFull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	server := &service{uploadSem: make(chan struct{}, 1)}
@@ -1363,6 +1414,35 @@ func (body *countingReadCloser) Close() error {
 	return nil
 }
 
+type blockingReadCloser struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (body *blockingReadCloser) Read(_ []byte) (int, error) {
+	body.startOnce.Do(func() {
+		close(body.started)
+	})
+	<-body.closed
+	return 0, os.ErrClosed
+}
+
+func (body *blockingReadCloser) Close() error {
+	body.closeOnce.Do(func() {
+		close(body.closed)
+	})
+	return nil
+}
+
 func writeTestAudio(t *testing.T, name string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
@@ -2027,16 +2107,33 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 	tm := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 
 	now := time.Now()
-	for i := 0; i < maxCancelTombstones+10; i++ {
-		tm.recordCancelledTaskID(fmt.Sprintf("task-%d", i), "whisperx", false, now)
+	for i := 0; i < maxCancelTombstones; i++ {
+		if !tm.recordCancelledTaskID(fmt.Sprintf("task-%d", i), "whisperx", false, now) {
+			t.Fatalf("record cancellation %d", i)
+		}
+	}
+	if tm.recordCancelledTaskID("overflow-task", "whisperx", false, now) {
+		t.Fatal("expected cancellation capacity to preserve existing records")
 	}
 
 	tm.mu.Lock()
 	count := len(tm.cancelledTaskIDs)
+	_, firstRecordExists := tm.cancelledTaskIDs["task-0"]
 	tm.mu.Unlock()
 
-	if count > maxCancelTombstones {
-		t.Fatalf("expected max cancelledTaskIDs count <= %d, got %d", maxCancelTombstones, count)
+	if count != maxCancelTombstones {
+		t.Fatalf("expected %d cancelled task IDs, got %d", maxCancelTombstones, count)
+	}
+	if !firstRecordExists {
+		t.Fatal("expected unexpired cancellation record not to be evicted")
+	}
+
+	found, err := tm.CancelAndWaitOrReserve("another-task", nil, time.Second)
+	if found {
+		t.Fatal("expected full cancellation reservation not to report success")
+	}
+	if !errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected cancellation capacity error, got %v", err)
 	}
 }
 

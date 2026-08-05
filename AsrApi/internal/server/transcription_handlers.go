@@ -76,11 +76,35 @@ func (s *service) transcribe(c *gin.Context) {
 		}
 	}
 
-	task := &ASRTask{Status: StatusPending}
+	taskCtx, taskCancel := context.WithCancel(context.Background())
+	task := &ASRTask{
+		ID:          taskID,
+		Status:      StatusUploading,
+		ResultChan:  make(chan ASRTaskResult, 1),
+		Ctx:         taskCtx,
+		CancelFunc:  taskCancel,
+		UploadBody:  c.Request.Body,
+		CreatedAt:   time.Now(),
+		cleanupDone: make(chan struct{}),
+	}
+	uploadRegistered := false
+	if taskID != "" {
+		if err := s.taskManager.BeginUpload(task); err != nil {
+			taskCancel()
+			statusCode, message := taskAdmissionErrorResponse(err)
+			c.JSON(statusCode, gin.H{"error": message})
+			return
+		}
+		uploadRegistered = true
+	}
 	taskStorageHandedOff := false
 	defer func() {
 		if !taskStorageHandedOff {
-			s.taskManager.releaseTaskStorage(task)
+			taskCancel()
+			s.taskManager.completeTaskCleanup(task)
+			if uploadRegistered {
+				s.taskManager.AbortUpload(task)
+			}
 		}
 	}()
 	upload, err := s.readTranscriptionUpload(c.Request, task)
@@ -113,8 +137,6 @@ func (s *service) transcribe(c *gin.Context) {
 		return
 	}
 
-	taskCtx, taskCancel := context.WithCancel(context.Background())
-
 	task.ID = taskID
 	task.Model = modelName
 	task.Level = upload.Level
@@ -122,16 +144,21 @@ func (s *service) transcribe(c *gin.Context) {
 	task.Filename = upload.Filename
 	task.TempFilePath = upload.TempFilePath
 	task.ResponseFormat = upload.ResponseFormat
-	task.ResultChan = make(chan ASRTaskResult, 1)
-	task.Ctx = taskCtx
-	task.CancelFunc = taskCancel
-	task.CreatedAt = time.Now()
 
 	log.Printf("[ASR API] Adding task %s for file %s to queue", task.ID, task.Filename)
-	if err := s.taskManager.Add(task); err != nil {
+	var addErr error
+	if uploadRegistered {
+		addErr = s.taskManager.CompleteUpload(task)
+	} else {
+		task.Status = StatusPending
+		task.UploadBody = nil
+		addErr = s.taskManager.Add(task)
+	}
+	if addErr != nil {
 		taskCancel()
 		removeTemporaryFile(upload.TempFilePath)
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+		statusCode, message := taskAdmissionErrorResponse(addErr)
+		c.JSON(statusCode, gin.H{"error": message})
 		return
 	}
 	taskStorageHandedOff = true
@@ -184,6 +211,13 @@ func (s *service) transcribe(c *gin.Context) {
 	}
 }
 
+func taskAdmissionErrorResponse(err error) (int, string) {
+	if errors.Is(err, errTaskCancelledDuringUpload) {
+		return http.StatusConflict, err.Error()
+	}
+	return http.StatusTooManyRequests, err.Error()
+}
+
 func transcriptionUploadErrorResponse(err error) (int, string) {
 	var maxBytesError *http.MaxBytesError
 	switch {
@@ -191,6 +225,8 @@ func transcriptionUploadErrorResponse(err error) (int, string) {
 		return http.StatusRequestEntityTooLarge, fmt.Sprintf("audio file exceeds %d MiB limit", maxAudioFileSize>>20)
 	case errors.Is(err, errStoredAudioCapacity):
 		return http.StatusTooManyRequests, err.Error()
+	case errors.Is(err, errTaskCancelledDuringUpload):
+		return http.StatusConflict, err.Error()
 	case errors.Is(err, errAudioFileRequired):
 		return http.StatusBadRequest, errAudioFileRequired.Error()
 	case errors.Is(err, errInvalidMultipartUpload):
@@ -294,6 +330,7 @@ func (s *service) storeAudioPart(input io.Reader, task *ASRTask) (string, error)
 		return "", err
 	}
 	tempPath := tempFile.Name()
+	task.TempFilePath = tempPath
 	complete := false
 	closed := false
 	defer func() {
@@ -322,7 +359,21 @@ func (s *service) storeAudioPart(input io.Reader, task *ASRTask) (string, error)
 func (s *service) copyAudioWithStorageReservation(output io.Writer, input io.Reader, task *ASRTask) error {
 	buffer := make([]byte, 32<<10)
 	for {
+		if task.Ctx != nil {
+			select {
+			case <-task.Ctx.Done():
+				return errTaskCancelledDuringUpload
+			default:
+			}
+		}
 		count, readErr := input.Read(buffer)
+		if task.Ctx != nil {
+			select {
+			case <-task.Ctx.Done():
+				return errTaskCancelledDuringUpload
+			default:
+			}
+		}
 		if count > 0 {
 			if task.TempFileSize+int64(count) > maxAudioFileSize {
 				return &http.MaxBytesError{Limit: maxAudioFileSize}
@@ -375,16 +426,20 @@ func (s *service) cancelTask(c *gin.Context) {
 	}
 
 	found, err := s.taskManager.CancelAndWaitOrReserve(id, s.cancelTaskForModel, cancelTaskCleanupTimeout)
-	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("task %s not found or already completed", id)})
-		return
-	}
 	if err != nil {
 		if errors.Is(err, errTaskCleanupTimeout) {
 			c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
 			return
 		}
+		if errors.Is(err, errCancellationCapacity) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to confirm upstream cancellation"})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("task %s not found or already completed", id)})
 		return
 	}
 
