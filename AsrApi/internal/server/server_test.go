@@ -1598,9 +1598,11 @@ func TestSystemEndpoint(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"upstream_status":"available"`) {
 		t.Fatalf("unexpected system response: %s", recorder.Body.String())
 	}
-	if strings.Contains(recorder.Body.String(), "upload_limit_bytes") ||
-		strings.Contains(recorder.Body.String(), "transcription_policy") {
-		t.Fatalf("expected health-only system response: %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), `"upload_limit_bytes":1073741824`) {
+		t.Fatalf("expected upload limit in system response: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "transcription_policy") {
+		t.Fatalf("expected no transcription policy in system response: %s", recorder.Body.String())
 	}
 }
 

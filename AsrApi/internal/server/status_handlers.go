@@ -126,8 +126,9 @@ func (s *service) system(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
-		"models": modelsList,
+		"status":             "ok",
+		"upload_limit_bytes": maxAudioFileSize,
+		"models":             modelsList,
 	})
 }
 
