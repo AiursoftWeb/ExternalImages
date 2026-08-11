@@ -497,7 +497,14 @@ func (tm *TaskManager) recordCancelledTaskID(id, model string, retryable bool, n
 		retryable = false
 	}
 	if _, exists := tm.cancelledTaskIDs[id]; !exists && len(tm.cancelledTaskIDs) >= maxCancelTombstones {
-		return false
+		if !retryable {
+			return false
+		}
+		oldestNonRetryableID, found := tm.oldestNonRetryableCancellationID()
+		if !found {
+			return false
+		}
+		delete(tm.cancelledTaskIDs, oldestNonRetryableID)
 	}
 	tm.cancelledTaskIDs[id] = cancellationRecord{
 		Model:     model,
@@ -505,6 +512,19 @@ func (tm *TaskManager) recordCancelledTaskID(id, model string, retryable bool, n
 		Retryable: retryable,
 	}
 	return true
+}
+
+func (tm *TaskManager) oldestNonRetryableCancellationID() (string, bool) {
+	var oldestID string
+	var oldestExpiry time.Time
+	for id, record := range tm.cancelledTaskIDs {
+		if record.Retryable || (!oldestExpiry.IsZero() && !record.ExpiresAt.Before(oldestExpiry)) {
+			continue
+		}
+		oldestID = id
+		oldestExpiry = record.ExpiresAt
+	}
+	return oldestID, !oldestExpiry.IsZero()
 }
 
 func (tm *TaskManager) pruneCancelledTaskIDs(now time.Time) {

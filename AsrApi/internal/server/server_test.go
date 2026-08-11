@@ -543,6 +543,57 @@ func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T)
 	}
 }
 
+func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("running-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+
+	now := time.Now()
+	for i := 0; i < maxCancelTombstones; i++ {
+		id := fmt.Sprintf("reserved-task-%d", i)
+		if !manager.recordCancelledTaskID(id, "", false, now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("record cancellation %d", i)
+		}
+	}
+
+	upstreamErr := errors.New("upstream unavailable")
+	found, err := manager.Cancel(task.ID, func(_, _ string) error {
+		return upstreamErr
+	})
+	if !found {
+		t.Fatal("expected running task to be found")
+	}
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
+	}
+
+	record, exists := manager.cancelledTaskIDs[task.ID]
+	if !exists || !record.Retryable {
+		t.Fatal("expected failed running-task cancellation to remain retryable")
+	}
+	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; exists {
+		t.Fatal("expected oldest non-retryable cancellation record to be evicted")
+	}
+
+	retryCalls := 0
+	found, err = manager.Cancel(task.ID, func(_, _ string) error {
+		retryCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry cancellation: %v", err)
+	}
+	if !found {
+		t.Fatal("expected failed cancellation to be retryable")
+	}
+	if retryCalls != 1 {
+		t.Fatalf("expected one upstream retry, got %d", retryCalls)
+	}
+}
+
 func TestCancelledTaskIDCannotBeReusedDuringTombstoneTTL(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	cancelledTask := testTask("reused-task", "whisperx", "")
@@ -2134,6 +2185,16 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 	}
 	if !errors.Is(err, errCancellationCapacity) {
 		t.Fatalf("expected cancellation capacity error, got %v", err)
+	}
+
+	retryableOnlyManager := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	for i := 0; i < maxCancelTombstones; i++ {
+		if !retryableOnlyManager.recordCancelledTaskID(fmt.Sprintf("retryable-task-%d", i), "whisperx", true, now) {
+			t.Fatalf("record retryable cancellation %d", i)
+		}
+	}
+	if retryableOnlyManager.recordCancelledTaskID("retryable-overflow-task", "whisperx", true, now) {
+		t.Fatal("expected full retryable cancellation capacity to preserve existing records")
 	}
 }
 
