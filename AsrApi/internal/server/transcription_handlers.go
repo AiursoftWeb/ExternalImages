@@ -137,19 +137,18 @@ func (s *service) transcribe(c *gin.Context) {
 		return
 	}
 
-	task.ID = taskID
-	task.Model = modelName
-	task.Level = upload.Level
-	task.Language = upload.Language
-	task.Filename = upload.Filename
-	task.TempFilePath = upload.TempFilePath
-	task.ResponseFormat = upload.ResponseFormat
-
-	log.Printf("[ASR API] Adding task %s for file %s to queue", task.ID, task.Filename)
+	log.Printf("[ASR API] Adding task %s for file %s to queue", taskID, upload.Filename)
 	var addErr error
 	if uploadRegistered {
-		addErr = s.taskManager.CompleteUpload(task)
+		addErr = s.taskManager.CompleteUpload(task, upload)
 	} else {
+		task.ID = taskID
+		task.Model = modelName
+		task.Level = upload.Level
+		task.Language = upload.Language
+		task.Filename = upload.Filename
+		task.TempFilePath = upload.TempFilePath
+		task.ResponseFormat = upload.ResponseFormat
 		task.Status = StatusPending
 		task.UploadBody = nil
 		addErr = s.taskManager.Add(task)

@@ -145,19 +145,24 @@ func (tm *TaskManager) BeginUpload(task *ASRTask) error {
 	return nil
 }
 
-func (tm *TaskManager) CompleteUpload(task *ASRTask) error {
+func (tm *TaskManager) CompleteUpload(task *ASRTask, upload transcriptionUpload) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if currentTask := tm.tasks[task.ID]; currentTask != task || task.Status != StatusUploading {
 		return errTaskCancelledDuringUpload
 	}
-	queue, exists := tm.queues[task.Model]
+	queue, exists := tm.queues[upload.Model]
 	if !exists {
-		return fmt.Errorf("model %s does not have a task queue", task.Model)
+		return fmt.Errorf("model %s does not have a task queue", upload.Model)
 	}
 	if len(queue.pending) >= queue.capacity {
 		return fmt.Errorf("task queue is full, please try again later")
 	}
+	task.Model = upload.Model
+	task.Level = upload.Level
+	task.Language = upload.Language
+	task.Filename = upload.Filename
+	task.ResponseFormat = upload.ResponseFormat
 	task.Status = StatusPending
 	task.UploadBody = nil
 	queue.pending = append(queue.pending, task)
@@ -294,9 +299,12 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		} else {
 			task.Status = StatusCancelFailed
 		}
-		delete(tm.tasks, id)
-		if !tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now()) {
+		cancellationRecorded := tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now())
+		if !cancellationRecorded {
 			log.Printf("[Queue] Cancellation reservation capacity is full for task %s", id)
+		}
+		if cancelErr == nil || cancellationRecorded {
+			delete(tm.tasks, id)
 		}
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
