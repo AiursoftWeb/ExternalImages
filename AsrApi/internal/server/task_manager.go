@@ -20,7 +20,7 @@ const (
 	defaultMaxStoredAudioSizeMiB       = 2048
 	maxConfiguredStoredAudioMiB        = 1 << 20
 	maxConfiguredConcurrency           = 1024
-	defaultTranscriptionTimeoutSeconds = 30 * 60
+	defaultTranscriptionTimeoutSeconds = 2 * 60 * 60
 	maxConfiguredDurationSeconds       = 24 * 60 * 60
 	maxCancelTombstones                = 1024
 	cancelTombstoneTTL                 = 3 * time.Hour

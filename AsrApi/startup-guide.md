@@ -119,7 +119,7 @@ docker run -d --name funasr-realtime \
 | `ASR_MAX_CONCURRENT_UPLOADS` | 网关同时接收并写入临时文件的上传数量上限，范围为 1–1024。达到上限时，新请求会在读取请求体之前返回 `429`。 | `2` |
 | `ASR_MAX_CONCURRENT_TRANSCRIPTIONS` | 不同模型之间同时执行转写任务的全局上限，范围为 1–1024。同一模型固定使用单 worker 串行执行，因此实际并发数不会超过已启用的离线模型数量；其余任务在对应模型队列中等待。 | `2` |
 | `ASR_MAX_STORED_AUDIO_SIZE_MIB` | 正在上传、排队中和运行中任务的临时音频文件总容量上限（MiB），范围为 1–1048576。达到上限时，新任务返回 `429`。 | `2048` |
-| `ASR_TRANSCRIPTION_TIMEOUT_SECONDS` | 单个任务进入队列后的总超时（秒），包含排队和执行时间，不包含上传时间。 | `1800` |
+| `ASR_TRANSCRIPTION_TIMEOUT_SECONDS` | 单个任务进入队列后的总超时（秒），包含排队和执行时间，不包含上传时间。 | `7200` |
 
 > **重要约束**：
 > - `ASR_ENABLE_WHISPERX` 和 `ASR_ENABLE_FUNASR` 不能同时为 `false`。网关启动时必须至少有一个引擎处于启用状态，否则会报错并拒绝启动。
