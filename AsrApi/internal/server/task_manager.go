@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	maxAudioFileSize                   = 1 << 30
+	maxAudioFileSize                   = 256 << 20
 	maxUploadRequestOverhead           = 1 << 20
 	maxTranscriptionFormFieldSize      = 4 << 10
 	maxCancelRequestSize               = 4 << 10

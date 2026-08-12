@@ -1012,7 +1012,7 @@ func TestTranscriptionUploadErrorResponseReturnsRequestEntityTooLarge(t *testing
 	if statusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, statusCode)
 	}
-	if message != "audio file exceeds 1024 MiB limit" {
+	if message != "audio file exceeds 256 MiB limit" {
 		t.Fatalf("unexpected oversized upload message %q", message)
 	}
 }
@@ -1874,7 +1874,7 @@ func TestSystemEndpoint(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"upstream_status":"available"`) {
 		t.Fatalf("unexpected system response: %s", recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), `"upload_limit_bytes":1073741824`) {
+	if !strings.Contains(recorder.Body.String(), `"upload_limit_bytes":268435456`) {
 		t.Fatalf("expected upload limit in system response: %s", recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "transcription_policy") {
