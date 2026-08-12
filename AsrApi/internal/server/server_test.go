@@ -253,6 +253,38 @@ func TestCancelPendingTaskReleasesQueueCapacityAndRemovesFile(t *testing.T) {
 	}
 }
 
+func TestCancelPendingTaskPreservesTaskWhenCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("pending-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add pending task: %v", err)
+	}
+
+	now := time.Now()
+	for i := 0; i < maxCancelTombstones; i++ {
+		if !manager.recordCancelledTaskID(fmt.Sprintf("reserved-task-%d", i), "", false, now) {
+			t.Fatalf("record cancellation %d", i)
+		}
+	}
+
+	found, err := manager.Cancel(task.ID, nil)
+	if !found {
+		t.Fatal("expected pending task to be found")
+	}
+	if !errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected cancellation capacity error, got %v", err)
+	}
+	if task.Status != StatusPending {
+		t.Fatalf("expected task to remain pending, got %q", task.Status)
+	}
+	if manager.tasks[task.ID] != task {
+		t.Fatal("expected task to remain tracked")
+	}
+	if err := manager.Add(testTask(task.ID, "whisperx", "")); err == nil {
+		t.Fatal("expected task ID reuse to be rejected")
+	}
+}
+
 func TestCancelRunningTaskPassesTaskIDToUpstream(t *testing.T) {
 	models := map[string]upstream{"whisperx": {}}
 	manager := NewTaskManager(1, maxAudioFileSize, models)
@@ -600,7 +632,7 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	}
 }
 
-func TestCancelRunningTaskRemainsTrackedWhenRetryableCancellationRecordsAreFull(t *testing.T) {
+func TestCancelRunningTaskDoesNotStartWhenRetryableCancellationRecordsAreFull(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	task := testTask("running-task", "whisperx", "")
 	if err := manager.Add(task); err != nil {
@@ -616,40 +648,33 @@ func TestCancelRunningTaskRemainsTrackedWhenRetryableCancellationRecordsAreFull(
 		}
 	}
 
-	upstreamErr := errors.New("upstream unavailable")
+	cancelCalls := 0
 	found, err := manager.Cancel(task.ID, func(_, _ string) error {
-		return upstreamErr
+		cancelCalls++
+		return errors.New("upstream unavailable")
 	})
 	if !found {
 		t.Fatal("expected running task to be found")
 	}
-	if !errors.Is(err, upstreamErr) {
-		t.Fatalf("expected upstream cancellation error, got %v", err)
+	if !errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected cancellation capacity error, got %v", err)
+	}
+	if cancelCalls != 0 {
+		t.Fatalf("expected cancellation not to start without reserved state, got %d calls", cancelCalls)
+	}
+	if task.Status != StatusRunning {
+		t.Fatalf("expected task to remain running, got %q", task.Status)
 	}
 
 	manager.mu.RLock()
 	trackedTask := manager.tasks[task.ID]
+	taskCount := len(manager.tasks)
 	manager.mu.RUnlock()
 	if trackedTask != task {
-		t.Fatal("expected task to remain tracked when retryable cancellation cannot be recorded")
+		t.Fatal("expected running task to remain tracked")
 	}
-
-	retryCalls := 0
-	found, err = manager.Cancel(task.ID, func(model, taskID string) error {
-		retryCalls++
-		if model != task.Model || taskID != task.ID {
-			t.Fatalf("unexpected retry target %s/%s", model, taskID)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("retry cancellation: %v", err)
-	}
-	if !found {
-		t.Fatal("expected retained task cancellation to be retryable")
-	}
-	if retryCalls != 1 {
-		t.Fatalf("expected one upstream retry, got %d", retryCalls)
+	if taskCount != 1 {
+		t.Fatalf("expected only the active task to remain tracked, got %d", taskCount)
 	}
 }
 

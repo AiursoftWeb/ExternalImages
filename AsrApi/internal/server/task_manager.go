@@ -249,14 +249,14 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 	}
 	prevStatus := task.Status
 	if prevStatus == StatusUploading || prevStatus == StatusPending {
+		if !tm.recordCancelledTaskID(id, task.Model, false, time.Now()) {
+			tm.mu.Unlock()
+			return true, errCancellationCapacity
+		}
 		task.Status = StatusCancelled
 		if prevStatus == StatusPending {
 			tm.removePendingTask(task)
 			delete(tm.tasks, id)
-		}
-		cancellationRecorded := tm.recordCancelledTaskID(id, task.Model, false, time.Now())
-		if !cancellationRecorded {
-			log.Printf("[Queue] Cancellation reservation capacity is full for task %s", id)
 		}
 		if task.CancelFunc != nil {
 			task.CancelFunc()
@@ -270,9 +270,6 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		}
 		log.Printf("[Queue] Task %s is cancelled. Previous status: %s", id, prevStatus)
 		if prevStatus == StatusUploading {
-			if !cancellationRecorded {
-				return true, errCancellationCapacity
-			}
 			return true, nil
 		}
 		tm.completeTaskCleanup(task)
@@ -280,6 +277,10 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		return true, nil
 	}
 
+	if !tm.recordCancelledTaskID(id, task.Model, true, time.Now()) {
+		tm.mu.Unlock()
+		return true, errCancellationCapacity
+	}
 	attempt := tm.startCancellationAttempt(id)
 	task.Status = StatusCancelling
 	if task.CancelFunc != nil {
@@ -299,13 +300,8 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		} else {
 			task.Status = StatusCancelFailed
 		}
-		cancellationRecorded := tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now())
-		if !cancellationRecorded {
-			log.Printf("[Queue] Cancellation reservation capacity is full for task %s", id)
-		}
-		if cancelErr == nil || cancellationRecorded {
-			delete(tm.tasks, id)
-		}
+		tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now())
+		delete(tm.tasks, id)
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
