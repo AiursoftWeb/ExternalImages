@@ -86,6 +86,7 @@ type cancellationRecord struct {
 	Model     string
 	ExpiresAt time.Time
 	Retryable bool
+	Evictable bool
 }
 
 type cancellationAttempt struct {
@@ -249,7 +250,7 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 	}
 	prevStatus := task.Status
 	if prevStatus == StatusUploading || prevStatus == StatusPending {
-		if !tm.recordCancelledTaskID(id, task.Model, false, time.Now()) {
+		if !tm.recordCancelledTaskID(id, task.Model, false, false, time.Now()) {
 			tm.mu.Unlock()
 			return true, errCancellationCapacity
 		}
@@ -277,7 +278,7 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		return true, nil
 	}
 
-	if !tm.recordCancelledTaskID(id, task.Model, true, time.Now()) {
+	if !tm.recordCancelledTaskID(id, task.Model, true, false, time.Now()) {
 		tm.mu.Unlock()
 		return true, errCancellationCapacity
 	}
@@ -300,7 +301,7 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		} else {
 			task.Status = StatusCancelFailed
 		}
-		tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now())
+		tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, false, time.Now())
 		delete(tm.tasks, id)
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
@@ -373,7 +374,7 @@ func (tm *TaskManager) reserveCancellationIfTaskAbsent(id string) (bool, error) 
 		return !record.Retryable, nil
 	}
 
-	if !tm.recordCancelledTaskID(id, "", false, time.Now()) {
+	if !tm.recordCancelledTaskID(id, "", false, true, time.Now()) {
 		return false, errCancellationCapacity
 	}
 	return true, nil
@@ -435,7 +436,7 @@ func (tm *TaskManager) runCompensatingCancellation(id, model string, cancelUpstr
 	cancelErr := cancelUpstreamFunc()
 
 	tm.mu.Lock()
-	if !tm.recordCancelledTaskID(id, model, cancelErr != nil, time.Now()) {
+	if !tm.recordCancelledTaskID(id, model, cancelErr != nil, false, time.Now()) {
 		log.Printf("[Queue] Cancellation reservation capacity is full for task %s", id)
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
@@ -495,34 +496,40 @@ func (tm *TaskManager) completeTaskCleanup(task *ASRTask) {
 	})
 }
 
-func (tm *TaskManager) recordCancelledTaskID(id, model string, retryable bool, now time.Time) bool {
+func (tm *TaskManager) recordCancelledTaskID(id, model string, retryable, evictable bool, now time.Time) bool {
 	tm.pruneCancelledTaskIDs(now)
-	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists && !currentRecord.Retryable {
-		retryable = false
+	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists {
+		if !currentRecord.Retryable {
+			retryable = false
+		}
+		if !currentRecord.Evictable {
+			evictable = false
+		}
 	}
 	if _, exists := tm.cancelledTaskIDs[id]; !exists && len(tm.cancelledTaskIDs) >= maxCancelTombstones {
-		if !retryable {
+		if evictable {
 			return false
 		}
-		oldestNonRetryableID, found := tm.oldestNonRetryableCancellationID()
+		oldestEvictableID, found := tm.oldestEvictableCancellationID()
 		if !found {
 			return false
 		}
-		delete(tm.cancelledTaskIDs, oldestNonRetryableID)
+		delete(tm.cancelledTaskIDs, oldestEvictableID)
 	}
 	tm.cancelledTaskIDs[id] = cancellationRecord{
 		Model:     model,
 		ExpiresAt: now.Add(cancelTombstoneTTL),
 		Retryable: retryable,
+		Evictable: evictable,
 	}
 	return true
 }
 
-func (tm *TaskManager) oldestNonRetryableCancellationID() (string, bool) {
+func (tm *TaskManager) oldestEvictableCancellationID() (string, bool) {
 	var oldestID string
 	var oldestExpiry time.Time
 	for id, record := range tm.cancelledTaskIDs {
-		if record.Retryable || (!oldestExpiry.IsZero() && !record.ExpiresAt.Before(oldestExpiry)) {
+		if !record.Evictable || (!oldestExpiry.IsZero() && !record.ExpiresAt.Before(oldestExpiry)) {
 			continue
 		}
 		oldestID = id
