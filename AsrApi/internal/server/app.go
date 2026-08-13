@@ -21,6 +21,7 @@ type service struct {
 	upstreams             map[string]upstream
 	client                *http.Client
 	statusClient          *http.Client
+	transcriptionTimeout  time.Duration
 	whisperxEnabled       bool
 	funasrEnabled         bool
 	funasrRealtimeEnabled bool
@@ -38,6 +39,7 @@ type serviceEnvironment struct {
 	maxStoredAudioSizeMiB       int
 	maxConcurrentUploads        int
 	maxConcurrentTranscriptions int
+	transcriptionTimeoutSeconds int
 }
 
 func Run(distFS embed.FS) error {
@@ -163,8 +165,9 @@ func newServiceFromEnvironment() (*service, error) {
 	s := &service{
 		token:                 token,
 		upstreams:             upstreams,
-		client:                &http.Client{Timeout: 10 * time.Minute},
+		client:                &http.Client{},
 		statusClient:          &http.Client{Timeout: cancelUpstreamTimeout},
+		transcriptionTimeout:  time.Duration(settings.transcriptionTimeoutSeconds) * time.Second,
 		whisperxEnabled:       settings.whisperxEnabled,
 		funasrEnabled:         settings.funasrEnabled,
 		funasrRealtimeEnabled: settings.funasrRealtimeEnabled,
@@ -214,6 +217,9 @@ func loadServiceEnvironment() (serviceEnvironment, error) {
 		return serviceEnvironment{}, err
 	}
 	if settings.maxConcurrentTranscriptions, err = environmentOrDefaultInt("ASR_MAX_CONCURRENT_TRANSCRIPTIONS", 2, maxConfiguredConcurrency); err != nil {
+		return serviceEnvironment{}, err
+	}
+	if settings.transcriptionTimeoutSeconds, err = environmentOrDefaultInt("ASR_TRANSCRIPTION_TIMEOUT_SECONDS", defaultTranscriptionTimeoutSeconds, maxConfiguredDurationSeconds); err != nil {
 		return serviceEnvironment{}, err
 	}
 	return settings, nil

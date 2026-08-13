@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -11,23 +12,28 @@ import (
 )
 
 const (
-	maxAudioFileSize              = 100 << 20
-	maxUploadRequestOverhead      = 1 << 20
-	maxTranscriptionFormFieldSize = 4 << 10
-	maxCancelRequestSize          = 4 << 10
-	maxTaskIDLength               = 128
-	defaultMaxStoredAudioSizeMiB  = 512
-	maxConfiguredStoredAudioMiB   = 1 << 20
-	maxConfiguredConcurrency      = 1024
-	maxCancelTombstones           = 1024
-	cancelTombstoneTTL            = 10 * time.Minute
-	cancelUpstreamTimeout         = 12 * time.Second
-	cancelTaskCleanupTimeout      = 12 * time.Second
+	maxAudioFileSize                   = 256 << 20
+	maxUploadRequestOverhead           = 1 << 20
+	maxTranscriptionFormFieldSize      = 4 << 10
+	maxCancelRequestSize               = 4 << 10
+	maxTaskIDLength                    = 128
+	defaultMaxStoredAudioSizeMiB       = 2048
+	maxConfiguredStoredAudioMiB        = 1 << 20
+	maxConfiguredConcurrency           = 1024
+	defaultTranscriptionTimeoutSeconds = 2 * 60 * 60
+	maxConfiguredDurationSeconds       = 24 * 60 * 60
+	maxCancelTombstones                = 1024
+	maxCancellationRetries             = 1024
+	cancelTombstoneTTL                 = 3 * time.Hour
+	cancelUpstreamTimeout              = 12 * time.Second
+	cancelTaskCleanupTimeout           = 12 * time.Second
 )
 
 var (
-	errStoredAudioCapacity = errors.New("stored audio capacity is full, please try again later")
-	errTaskCleanupTimeout  = errors.New("timed out waiting for cancelled task cleanup")
+	errStoredAudioCapacity       = errors.New("stored audio capacity is full, please try again later")
+	errTaskCleanupTimeout        = errors.New("timed out waiting for cancelled task cleanup")
+	errCancellationCapacity      = errors.New("cancellation reservation capacity is full, please try again later")
+	errTaskCancelledDuringUpload = errors.New("task was cancelled during upload")
 )
 
 type upstream struct {
@@ -39,6 +45,7 @@ type upstream struct {
 type TaskStatus string
 
 const (
+	StatusUploading    TaskStatus = "uploading"
 	StatusPending      TaskStatus = "pending"
 	StatusRunning      TaskStatus = "running"
 	StatusCancelling   TaskStatus = "cancelling"
@@ -63,6 +70,7 @@ type ASRTask struct {
 	ResultChan      chan ASRTaskResult `json:"-"`
 	Ctx             context.Context    `json:"-"`
 	CancelFunc      context.CancelFunc `json:"-"`
+	UploadBody      io.Closer          `json:"-"`
 	storageReserved bool
 	cleanupDone     chan struct{}
 	cleanupOnce     sync.Once
@@ -79,6 +87,7 @@ type cancellationRecord struct {
 	Model     string
 	ExpiresAt time.Time
 	Retryable bool
+	Evictable bool
 }
 
 type cancellationAttempt struct {
@@ -120,6 +129,60 @@ func NewTaskManager(queueSize int, maxStoredBytes int64, models map[string]upstr
 	return manager
 }
 
+func (tm *TaskManager) BeginUpload(task *ASRTask) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if task.cleanupDone == nil {
+		task.cleanupDone = make(chan struct{})
+	}
+	tm.pruneCancelledTaskIDs(time.Now())
+	if _, exists := tm.cancelledTaskIDs[task.ID]; exists {
+		return errTaskCancelledDuringUpload
+	}
+	if _, exists := tm.cancellationAttempts[task.ID]; exists {
+		return errTaskCancelledDuringUpload
+	}
+	if _, exists := tm.tasks[task.ID]; exists {
+		return fmt.Errorf("task %s already exists", task.ID)
+	}
+	task.Status = StatusUploading
+	tm.tasks[task.ID] = task
+	return nil
+}
+
+func (tm *TaskManager) CompleteUpload(task *ASRTask, upload transcriptionUpload) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if currentTask := tm.tasks[task.ID]; currentTask != task || task.Status != StatusUploading {
+		return errTaskCancelledDuringUpload
+	}
+	queue, exists := tm.queues[upload.Model]
+	if !exists {
+		return fmt.Errorf("model %s does not have a task queue", upload.Model)
+	}
+	if len(queue.pending) >= queue.capacity {
+		return fmt.Errorf("task queue is full, please try again later")
+	}
+	task.Model = upload.Model
+	task.Level = upload.Level
+	task.Language = upload.Language
+	task.Filename = upload.Filename
+	task.ResponseFormat = upload.ResponseFormat
+	task.Status = StatusPending
+	task.UploadBody = nil
+	queue.pending = append(queue.pending, task)
+	select {
+	case queue.notify <- struct{}{}:
+	default:
+	}
+	log.Printf("[Queue] Uploaded task %s added to queue. Filename: %s, Model: %s, Level: %s (Queue size: %d)", task.ID, task.Filename, task.Model, task.Level, len(queue.pending))
+	return nil
+}
+
+func (tm *TaskManager) AbortUpload(task *ASRTask) {
+	tm.completeTaskCleanup(task)
+}
+
 func (tm *TaskManager) Add(task *ASRTask) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -129,6 +192,9 @@ func (tm *TaskManager) Add(task *ASRTask) error {
 	tm.pruneCancelledTaskIDs(time.Now())
 	if _, exists := tm.cancelledTaskIDs[task.ID]; exists {
 		return fmt.Errorf("task %s was recently cancelled", task.ID)
+	}
+	if _, exists := tm.cancellationAttempts[task.ID]; exists {
+		return fmt.Errorf("task %s cancellation is in progress", task.ID)
 	}
 	if _, exists := tm.tasks[task.ID]; exists {
 		return fmt.Errorf("task %s already exists", task.ID)
@@ -156,44 +222,65 @@ func (tm *TaskManager) Add(task *ASRTask) error {
 }
 
 func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID string) error) (bool, error) {
+	_, found, err := tm.cancel(id, cancelUpstreamFunc)
+	return found, err
+}
+
+func (tm *TaskManager) cancel(id string, cancelUpstreamFunc func(model, taskID string) error) (*ASRTask, bool, error) {
 	tm.mu.Lock()
 	tm.pruneCancelledTaskIDs(time.Now())
+	task, taskExists := tm.tasks[id]
 	if attempt, exists := tm.cancellationAttempts[id]; exists {
 		tm.mu.Unlock()
-		return waitForCancellationAttempt(attempt)
+		found, err := waitForCancellationAttempt(attempt)
+		return task, found, err
+	}
+	if taskExists && task.Status == StatusCancelled {
+		tm.mu.Unlock()
+		return task, true, nil
 	}
 	if record, exists := tm.cancelledTaskIDs[id]; exists {
 		if record.Retryable {
 			attempt := tm.startCancellationAttempt(id)
 			tm.mu.Unlock()
-			return tm.retryCancellation(id, record, attempt, cancelUpstreamFunc)
+			found, err := tm.retryCancellation(id, record, attempt, cancelUpstreamFunc)
+			return task, found, err
 		}
 		tm.mu.Unlock()
-		return false, nil
+		return task, false, nil
 	}
-	task, ok := tm.tasks[id]
-	if !ok {
+	if !taskExists {
 		tm.mu.Unlock()
-		return false, nil
+		return nil, false, nil
 	}
-	if task.Status == StatusCompleted || task.Status == StatusFailed || task.Status == StatusCancelled {
+	if task.Status == StatusCompleted || task.Status == StatusFailed {
 		tm.mu.Unlock()
-		return false, nil
+		return task, false, nil
 	}
 	prevStatus := task.Status
-	if prevStatus == StatusPending {
+	if prevStatus == StatusUploading || prevStatus == StatusPending {
+		tm.recordCompletedCancellation(id, task.Model, time.Now())
 		task.Status = StatusCancelled
-		tm.removePendingTask(task)
-		delete(tm.tasks, id)
-		tm.recordCancelledTaskID(id, task.Model, false, time.Now())
+		if prevStatus == StatusPending {
+			tm.removePendingTask(task)
+		}
 		if task.CancelFunc != nil {
 			task.CancelFunc()
 		}
+		uploadBody := task.UploadBody
 		tm.mu.Unlock()
+		if uploadBody != nil {
+			if err := uploadBody.Close(); err != nil {
+				log.Printf("[Queue] Failed to close upload body for task %s: %v", id, err)
+			}
+		}
 		log.Printf("[Queue] Task %s is cancelled. Previous status: %s", id, prevStatus)
+		if prevStatus == StatusUploading {
+			return task, true, nil
+		}
 		tm.completeTaskCleanup(task)
 		publishTaskResult(task, cancelledTaskResult())
-		return true, nil
+		return task, true, nil
 	}
 
 	attempt := tm.startCancellationAttempt(id)
@@ -215,8 +302,11 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		} else {
 			task.Status = StatusCancelFailed
 		}
-		delete(tm.tasks, id)
-		tm.recordCancelledTaskID(id, task.Model, cancelErr != nil, time.Now())
+		if cancelErr == nil {
+			tm.recordCompletedCancellation(id, task.Model, time.Now())
+		} else {
+			tm.recordRetryableCancellation(id, task.Model, time.Now())
+		}
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
@@ -228,21 +318,17 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 			Body:       []byte(`{"error":"failed to confirm upstream cancellation"}`),
 			Err:        cancelErr,
 		})
-		return true, cancelErr
+		return task, true, cancelErr
 	}
 
 	log.Printf("[Queue] Task %s is cancelled. Previous status: %s", id, prevStatus)
 	publishTaskResult(task, cancelledTaskResult())
-	return true, nil
+	return task, true, nil
 }
 
 func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, taskID string) error, cleanupTimeout time.Duration) (bool, error) {
-	tm.mu.RLock()
-	task := tm.tasks[id]
-	tm.mu.RUnlock()
-
-	found, err := tm.Cancel(id, cancelUpstreamFunc)
-	if !found || err != nil || task == nil {
+	task, found, err := tm.cancel(id, cancelUpstreamFunc)
+	if err != nil || task == nil {
 		return found, err
 	}
 
@@ -250,10 +336,48 @@ func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, t
 	defer timer.Stop()
 	select {
 	case <-task.cleanupDone:
-		return true, nil
+		return found, nil
 	case <-timer.C:
-		return true, errTaskCleanupTimeout
+		return found, errTaskCleanupTimeout
 	}
+}
+
+func (tm *TaskManager) CancelAndWaitOrReserve(id string, cancelUpstreamFunc func(model, taskID string) error, cleanupTimeout time.Duration) (bool, error) {
+	for {
+		reserved, err := tm.reserveCancellationIfTaskAbsent(id)
+		if err != nil {
+			return false, err
+		}
+		if reserved {
+			return true, nil
+		}
+
+		found, err := tm.CancelAndWait(id, cancelUpstreamFunc, cleanupTimeout)
+		if found || err != nil {
+			return found, err
+		}
+	}
+}
+
+func (tm *TaskManager) reserveCancellationIfTaskAbsent(id string) (bool, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.pruneCancelledTaskIDs(time.Now())
+	if _, exists := tm.tasks[id]; exists {
+		return false, nil
+	}
+	if _, exists := tm.cancellationAttempts[id]; exists {
+		return false, nil
+	}
+	if record, exists := tm.cancelledTaskIDs[id]; exists {
+		return !record.Retryable, nil
+	}
+
+	if !tm.recordCancellationTombstone(id, "", time.Now()) {
+		return false, errCancellationCapacity
+	}
+	return true, nil
 }
 
 func (tm *TaskManager) retryCancellation(id string, record cancellationRecord, attempt *cancellationAttempt, cancelUpstreamFunc func(model, taskID string) error) (bool, error) {
@@ -263,12 +387,10 @@ func (tm *TaskManager) retryCancellation(id string, record cancellationRecord, a
 	}
 
 	tm.mu.Lock()
-	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists {
-		currentRecord.ExpiresAt = time.Now().Add(cancelTombstoneTTL)
-		if cancelErr == nil {
-			currentRecord.Retryable = false
-		}
-		tm.cancelledTaskIDs[id] = currentRecord
+	if cancelErr == nil {
+		tm.recordCompletedCancellation(id, record.Model, time.Now())
+	} else {
+		tm.recordRetryableCancellation(id, record.Model, time.Now())
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
@@ -312,7 +434,11 @@ func (tm *TaskManager) runCompensatingCancellation(id, model string, cancelUpstr
 	cancelErr := cancelUpstreamFunc()
 
 	tm.mu.Lock()
-	tm.recordCancelledTaskID(id, model, cancelErr != nil, time.Now())
+	if cancelErr == nil {
+		tm.recordCompletedCancellation(id, model, time.Now())
+	} else {
+		tm.recordRetryableCancellation(id, model, time.Now())
+	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
 	return cancelErr
@@ -363,34 +489,118 @@ func (tm *TaskManager) releaseTaskStorage(task *ASRTask) {
 }
 
 func (tm *TaskManager) completeTaskCleanup(task *ASRTask) {
-	removeTemporaryFile(task.TempFilePath)
-	tm.releaseTaskStorage(task)
 	task.cleanupOnce.Do(func() {
+		removeTemporaryFile(task.TempFilePath)
+		tm.releaseTaskStorage(task)
+		tm.mu.Lock()
+		if currentTask := tm.tasks[task.ID]; currentTask == task {
+			delete(tm.tasks, task.ID)
+		}
+		tm.mu.Unlock()
 		close(task.cleanupDone)
 	})
 }
 
-func (tm *TaskManager) recordCancelledTaskID(id, model string, retryable bool, now time.Time) {
+func (tm *TaskManager) recordCancellationTombstone(id, model string, now time.Time) bool {
 	tm.pruneCancelledTaskIDs(now)
-	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists && !currentRecord.Retryable {
-		retryable = false
+	currentRecord, exists := tm.cancelledTaskIDs[id]
+	if exists {
+		return !currentRecord.Retryable
+	}
+	if tm.evictableCancellationCount() >= maxCancelTombstones {
+		return false
 	}
 	tm.cancelledTaskIDs[id] = cancellationRecord{
 		Model:     model,
 		ExpiresAt: now.Add(cancelTombstoneTTL),
-		Retryable: retryable,
+		Evictable: true,
 	}
-	if len(tm.cancelledTaskIDs) > maxCancelTombstones {
-		oldestID := id
-		oldestExpiry := tm.cancelledTaskIDs[id].ExpiresAt
-		for cancelledID, record := range tm.cancelledTaskIDs {
-			if record.ExpiresAt.Before(oldestExpiry) {
-				oldestID = cancelledID
-				oldestExpiry = record.ExpiresAt
-			}
+	return true
+}
+
+func (tm *TaskManager) recordRetryableCancellation(id, model string, now time.Time) {
+	tm.pruneCancelledTaskIDs(now)
+	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists {
+		if !currentRecord.Retryable {
+			return
 		}
-		delete(tm.cancelledTaskIDs, oldestID)
+		currentRecord.ExpiresAt = now.Add(cancelTombstoneTTL)
+		tm.cancelledTaskIDs[id] = currentRecord
+		return
 	}
+	if tm.retryableCancellationCount() >= maxCancellationRetries {
+		oldestRetryableID, found := tm.oldestRetryableCancellationID()
+		if found {
+			delete(tm.cancelledTaskIDs, oldestRetryableID)
+		}
+	}
+	tm.cancelledTaskIDs[id] = cancellationRecord{
+		Model:     model,
+		ExpiresAt: now.Add(cancelTombstoneTTL),
+		Retryable: true,
+	}
+}
+
+func (tm *TaskManager) recordCompletedCancellation(id, model string, now time.Time) {
+	tm.pruneCancelledTaskIDs(now)
+	currentRecord, exists := tm.cancelledTaskIDs[id]
+	if (!exists || !currentRecord.Evictable) && tm.evictableCancellationCount() >= maxCancelTombstones {
+		oldestEvictableID, found := tm.oldestEvictableCancellationID()
+		if found {
+			delete(tm.cancelledTaskIDs, oldestEvictableID)
+		}
+	}
+	tm.cancelledTaskIDs[id] = cancellationRecord{
+		Model:     model,
+		ExpiresAt: now.Add(cancelTombstoneTTL),
+		Evictable: true,
+	}
+}
+
+func (tm *TaskManager) evictableCancellationCount() int {
+	count := 0
+	for _, record := range tm.cancelledTaskIDs {
+		if record.Evictable {
+			count++
+		}
+	}
+	return count
+}
+
+func (tm *TaskManager) retryableCancellationCount() int {
+	count := 0
+	for _, record := range tm.cancelledTaskIDs {
+		if record.Retryable {
+			count++
+		}
+	}
+	return count
+}
+
+func (tm *TaskManager) oldestEvictableCancellationID() (string, bool) {
+	var oldestID string
+	var oldestExpiry time.Time
+	for id, record := range tm.cancelledTaskIDs {
+		if !record.Evictable || (!oldestExpiry.IsZero() && !record.ExpiresAt.Before(oldestExpiry)) {
+			continue
+		}
+		oldestID = id
+		oldestExpiry = record.ExpiresAt
+	}
+	return oldestID, !oldestExpiry.IsZero()
+}
+
+func (tm *TaskManager) oldestRetryableCancellationID() (string, bool) {
+	var oldestID string
+	var oldestExpiry time.Time
+	for id, record := range tm.cancelledTaskIDs {
+		if !record.Retryable || (!oldestExpiry.IsZero() && !record.ExpiresAt.Before(oldestExpiry)) {
+			continue
+		}
+		oldestID = id
+		oldestExpiry = record.ExpiresAt
+	}
+	return oldestID, !oldestExpiry.IsZero()
 }
 
 func (tm *TaskManager) pruneCancelledTaskIDs(now time.Time) {
