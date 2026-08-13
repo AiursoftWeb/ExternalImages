@@ -160,8 +160,19 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 
 	respBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		if errors.Is(executionContext.Err(), context.DeadlineExceeded) {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+			return ASRTaskResult{
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       []byte(`{"error":"transcription execution timed out"}`),
+				Err:        context.DeadlineExceeded,
+			}
+		}
+		if task.Ctx.Err() == nil {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+		}
 		return ASRTaskResult{
-			StatusCode: http.StatusInternalServerError,
+			StatusCode: http.StatusBadGateway,
 			Body:       []byte(`{"error":"failed to read upstream response"}`),
 			Err:        err,
 		}

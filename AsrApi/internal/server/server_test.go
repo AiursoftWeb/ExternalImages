@@ -1357,6 +1357,101 @@ func TestProcessTaskCancelsUpstreamAfterTransportFailure(t *testing.T) {
 	}
 }
 
+func TestProcessTaskCancelsUpstreamAfterResponseBodyTimeout(t *testing.T) {
+	const taskID = "response-body-timeout"
+	cancelledTaskID := make(chan string, 1)
+	releaseResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+		<-releaseResponse
+	}))
+	defer func() {
+		releaseOnce.Do(func() {
+			close(releaseResponse)
+		})
+		upstreamServer.Close()
+	}()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	server := &service{
+		upstreams:            models,
+		client:               &http.Client{},
+		statusClient:         &http.Client{Timeout: time.Second},
+		transcriptionTimeout: 50 * time.Millisecond,
+	}
+	task := testTask(taskID, "whisperx", writeTestAudio(t, "response-body-timeout.wav"))
+
+	result := server.processTask(task)
+	if result.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, result.StatusCode)
+	}
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", result.Err)
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != taskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", taskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+}
+
+func TestProcessTaskCancelsUpstreamAfterResponseBodyFailure(t *testing.T) {
+	const taskID = "response-body-failure"
+	cancelledTaskID := make(chan string, 1)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writer.Header().Set("Content-Length", "100")
+		writer.WriteHeader(http.StatusOK)
+		if _, err := writer.Write([]byte("incomplete")); err != nil {
+			t.Errorf("write partial response: %v", err)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	server := &service{
+		upstreams:    models,
+		client:       &http.Client{},
+		statusClient: &http.Client{Timeout: time.Second},
+	}
+	task := testTask(taskID, "whisperx", writeTestAudio(t, "response-body-failure.wav"))
+
+	result := server.processTask(task)
+	if result.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, result.StatusCode)
+	}
+	if result.Err == nil {
+		t.Fatal("expected response body read failure")
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != taskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", taskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+}
+
 func TestQueueWorkerContinuesAfterTranscriptionTimeout(t *testing.T) {
 	const timedOutTaskID = "timed-out-task"
 	const nextTaskID = "next-task"
