@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"time"
 )
 
 func (s *service) startQueueWorkers(tm *TaskManager) {
@@ -52,9 +53,6 @@ func (tm *TaskManager) finishTask(task *ASRTask, result ASRTaskResult) bool {
 	} else {
 		task.Status = StatusCompleted
 		log.Printf("[Queue] Worker finished task %s. Result: Success", task.ID)
-	}
-	if currentTask := tm.tasks[task.ID]; currentTask == task {
-		delete(tm.tasks, task.ID)
 	}
 	return true
 }
@@ -103,6 +101,9 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 		}
 	}
 
+	executionContext, cancelExecution := context.WithTimeout(task.Ctx, s.configuredTranscriptionTimeout())
+	defer cancelExecution()
+
 	modelForUpstream := backend.model
 	if task.Level != "" {
 		modelForUpstream = task.Level
@@ -120,7 +121,7 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 
 	body, contentType := buildUpstreamBody(file, task.Filename, modelForUpstream, task.Language, task.ResponseFormat)
 
-	request, err := http.NewRequestWithContext(task.Ctx, http.MethodPost, backend.url+"/v1/audio/transcriptions", body)
+	request, err := http.NewRequestWithContext(executionContext, http.MethodPost, backend.url+"/v1/audio/transcriptions", body)
 	if err != nil {
 		return ASRTaskResult{
 			StatusCode: http.StatusInternalServerError,
@@ -135,6 +136,14 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 	log.Printf("[Queue] Sending HTTP post request to %s upstream for task %s", task.Model, task.ID)
 	response, err := s.client.Do(request)
 	if err != nil {
+		if errors.Is(executionContext.Err(), context.DeadlineExceeded) {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+			return ASRTaskResult{
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       []byte(`{"error":"transcription execution timed out"}`),
+				Err:        context.DeadlineExceeded,
+			}
+		}
 		if task.Ctx.Err() == nil {
 			s.cancelUpstreamAfterRequestFailure(task, backend)
 		}
@@ -148,8 +157,19 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 
 	respBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		if errors.Is(executionContext.Err(), context.DeadlineExceeded) {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+			return ASRTaskResult{
+				StatusCode: http.StatusGatewayTimeout,
+				Body:       []byte(`{"error":"transcription execution timed out"}`),
+				Err:        context.DeadlineExceeded,
+			}
+		}
+		if task.Ctx.Err() == nil {
+			s.cancelUpstreamAfterRequestFailure(task, backend)
+		}
 		return ASRTaskResult{
-			StatusCode: http.StatusInternalServerError,
+			StatusCode: http.StatusBadGateway,
 			Body:       []byte(`{"error":"failed to read upstream response"}`),
 			Err:        err,
 		}
@@ -160,6 +180,13 @@ func (s *service) processTask(task *ASRTask) ASRTaskResult {
 		Body:       respBody,
 		Header:     response.Header,
 	}
+}
+
+func (s *service) configuredTranscriptionTimeout() time.Duration {
+	if s.transcriptionTimeout > 0 {
+		return s.transcriptionTimeout
+	}
+	return defaultTranscriptionTimeoutSeconds * time.Second
 }
 
 func (s *service) cancelUpstreamAfterRequestFailure(task *ASRTask, backend upstream) {

@@ -253,6 +253,45 @@ func TestCancelPendingTaskReleasesQueueCapacityAndRemovesFile(t *testing.T) {
 	}
 }
 
+func TestCancelPendingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("pending-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add pending task: %v", err)
+	}
+
+	now := time.Now()
+	for i := 0; i < maxCancellationRetries; i++ {
+		manager.recordRetryableCancellation(
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
+			now.Add(time.Duration(i)*time.Second))
+	}
+
+	found, err := manager.Cancel(task.ID, nil)
+	if !found {
+		t.Fatal("expected pending task to be found")
+	}
+	if err != nil {
+		t.Fatalf("cancel pending task: %v", err)
+	}
+	if task.Status != StatusCancelled {
+		t.Fatalf("expected task to be cancelled, got %q", task.Status)
+	}
+	if task.Ctx.Err() == nil {
+		t.Fatal("expected pending task context to be cancelled")
+	}
+	if _, exists := manager.tasks[task.ID]; exists {
+		t.Fatal("expected cancelled task to be removed")
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; !exists {
+		t.Fatal("expected retryable cancellation record to be preserved")
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Evictable {
+		t.Fatal("expected completed task cancellation record to be evictable")
+	}
+}
+
 func TestCancelRunningTaskPassesTaskIDToUpstream(t *testing.T) {
 	models := map[string]upstream{"whisperx": {}}
 	manager := NewTaskManager(1, maxAudioFileSize, models)
@@ -455,7 +494,7 @@ func TestConcurrentCancellationSharesUpstreamResult(t *testing.T) {
 	}
 }
 
-func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T) {
+func TestCancelRunningTaskRetainsTaskUntilCleanupWhenUpstreamCancellationFails(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	task := testTask("running-task", "whisperx", "")
 	if err := manager.Add(task); err != nil {
@@ -477,8 +516,8 @@ func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T)
 	manager.mu.RLock()
 	_, exists := manager.tasks[task.ID]
 	manager.mu.RUnlock()
-	if exists {
-		t.Fatal("expected task to be removed after cancellation failure")
+	if !exists {
+		t.Fatal("expected task to remain tracked until cleanup")
 	}
 	if task.Status != StatusCancelFailed {
 		t.Fatalf("expected status %q, got %q", StatusCancelFailed, task.Status)
@@ -541,6 +580,243 @@ func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T)
 	if retryCalls != 2 {
 		t.Fatalf("expected confirmed cancellation not to call upstream, got %d calls", retryCalls)
 	}
+	manager.completeTaskCleanup(task)
+	manager.mu.RLock()
+	_, exists = manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if exists {
+		t.Fatal("expected task to be removed after cleanup")
+	}
+}
+
+func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("running-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+
+	now := time.Now()
+	for i := 0; i < maxCancelTombstones; i++ {
+		id := fmt.Sprintf("reserved-task-%d", i)
+		if !manager.recordCancellationTombstone(id, "", now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("record cancellation %d", i)
+		}
+	}
+
+	upstreamErr := errors.New("upstream unavailable")
+	found, err := manager.Cancel(task.ID, func(_, _ string) error {
+		return upstreamErr
+	})
+	if !found {
+		t.Fatal("expected running task to be found")
+	}
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
+	}
+
+	record, exists := manager.cancelledTaskIDs[task.ID]
+	if !exists || !record.Retryable {
+		t.Fatal("expected failed running-task cancellation to remain retryable")
+	}
+	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; !exists {
+		t.Fatal("expected tombstones to be preserved while cancellation is retryable")
+	}
+
+	retryCalls := 0
+	found, err = manager.Cancel(task.ID, func(_, _ string) error {
+		retryCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry cancellation: %v", err)
+	}
+	if !found {
+		t.Fatal("expected failed cancellation to be retryable")
+	}
+	if retryCalls != 1 {
+		t.Fatalf("expected one upstream retry, got %d", retryCalls)
+	}
+	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; exists {
+		t.Fatal("expected oldest tombstone to be evicted after cancellation succeeds")
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; record.Retryable || !record.Evictable {
+		t.Fatal("expected successful cancellation retry to become an evictable tombstone")
+	}
+	manager.mu.RLock()
+	_, taskExists := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if !taskExists {
+		t.Fatal("expected task to remain tracked until cleanup")
+	}
+	manager.completeTaskCleanup(task)
+}
+
+func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("running-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+
+	now := time.Now()
+	for i := 0; i < maxCancellationRetries; i++ {
+		id := fmt.Sprintf("retryable-task-%d", i)
+		manager.recordRetryableCancellation(id, "whisperx", now.Add(time.Duration(i)*time.Second))
+	}
+
+	cancelCalls := 0
+	found, err := manager.Cancel(task.ID, func(_, _ string) error {
+		cancelCalls++
+		return errors.New("upstream unavailable")
+	})
+	if !found {
+		t.Fatal("expected running task to be found")
+	}
+	if err == nil || errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("expected cancellation to reach upstream once, got %d calls", cancelCalls)
+	}
+	if task.Status != StatusCancelFailed {
+		t.Fatalf("expected task cancellation to remain retryable, got %q", task.Status)
+	}
+	if task.Ctx.Err() == nil {
+		t.Fatal("expected running task context to be cancelled")
+	}
+
+	manager.mu.RLock()
+	trackedTask := manager.tasks[task.ID]
+	taskCount := len(manager.tasks)
+	manager.mu.RUnlock()
+	if trackedTask != task {
+		t.Fatal("expected cancelled task to remain tracked until cleanup")
+	}
+	if taskCount != 1 {
+		t.Fatalf("expected one task awaiting cleanup, got %d", taskCount)
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Retryable || record.Evictable {
+		t.Fatal("expected failed cancellation to remain protected and retryable")
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if count := manager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+	manager.completeTaskCleanup(task)
+}
+
+func TestCompensatingCancellationRetriesRemainBounded(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	now := time.Now()
+	for i := 0; i < maxCancellationRetries; i++ {
+		manager.recordRetryableCancellation(
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
+			now.Add(time.Duration(i)*time.Second))
+	}
+
+	upstreamErr := errors.New("upstream unavailable")
+	err := manager.runCompensatingCancellation("compensating-task", "whisperx", func() error {
+		return upstreamErr
+	})
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
+	}
+	if count := manager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if record := manager.cancelledTaskIDs["compensating-task"]; !record.Retryable {
+		t.Fatal("expected compensating cancellation failure to remain retryable")
+	}
+}
+
+func TestCancellationAttemptOwnsTaskIDAfterRetryRecordEviction(t *testing.T) {
+	testCases := []struct {
+		name      string
+		cancelErr error
+		retryable bool
+	}{
+		{name: "success", retryable: false},
+		{name: "failure", cancelErr: errors.New("upstream unavailable"), retryable: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			const taskID = "evicted-retry"
+			manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+			now := time.Now()
+			manager.recordRetryableCancellation(taskID, "whisperx", now)
+			for i := 1; i < maxCancellationRetries; i++ {
+				manager.recordRetryableCancellation(
+					fmt.Sprintf("retryable-task-%d", i),
+					"whisperx",
+					now.Add(time.Duration(i)*time.Second))
+			}
+
+			cancelStarted := make(chan struct{})
+			releaseCancel := make(chan struct{})
+			cancelled := make(chan error, 1)
+			go func() {
+				_, err := manager.Cancel(taskID, func(_, _ string) error {
+					close(cancelStarted)
+					<-releaseCancel
+					return testCase.cancelErr
+				})
+				cancelled <- err
+			}()
+			<-cancelStarted
+
+			manager.mu.Lock()
+			manager.recordRetryableCancellation(
+				"retryable-overflow",
+				"whisperx",
+				now.Add(maxCancellationRetries*time.Second))
+			_, recordExists := manager.cancelledTaskIDs[taskID]
+			_, attemptExists := manager.cancellationAttempts[taskID]
+			manager.mu.Unlock()
+			if recordExists {
+				t.Fatal("expected active retry record to be evicted")
+			}
+			if !attemptExists {
+				t.Fatal("expected cancellation attempt to remain active")
+			}
+			if err := manager.Add(testTask(taskID, "whisperx", "")); err == nil {
+				t.Fatal("expected queued task admission to reject an active cancellation attempt")
+			}
+			if err := manager.BeginUpload(testTask(taskID, "whisperx", "")); !errors.Is(err, errTaskCancelledDuringUpload) {
+				t.Fatalf("expected upload admission to reject an active cancellation attempt, got %v", err)
+			}
+
+			close(releaseCancel)
+			if err := <-cancelled; !errors.Is(err, testCase.cancelErr) {
+				t.Fatalf("expected cancellation error %v, got %v", testCase.cancelErr, err)
+			}
+			manager.mu.RLock()
+			record, restored := manager.cancelledTaskIDs[taskID]
+			_, attemptExists = manager.cancellationAttempts[taskID]
+			manager.mu.RUnlock()
+			if !restored {
+				t.Fatal("expected cancellation result to restore the evicted record")
+			}
+			if record.Retryable != testCase.retryable {
+				t.Fatalf("expected retryable=%t, got %+v", testCase.retryable, record)
+			}
+			if attemptExists {
+				t.Fatal("expected completed cancellation attempt to be removed")
+			}
+			if count := manager.retryableCancellationCount(); count > maxCancellationRetries {
+				t.Fatalf("expected at most %d retryable records, got %d", maxCancellationRetries, count)
+			}
+		})
+	}
 }
 
 func TestCancelledTaskIDCannotBeReusedDuringTombstoneTTL(t *testing.T) {
@@ -565,6 +841,7 @@ func TestCancelledTaskIDCannotBeReusedDuringTombstoneTTL(t *testing.T) {
 	if manager.finishTask(cancelledTask, ASRTaskResult{StatusCode: http.StatusOK}) {
 		t.Fatal("expected cancelled worker result not to be published")
 	}
+	manager.completeTaskCleanup(cancelledTask)
 }
 
 func TestCancelledTaskIDCanBeReusedAfterTombstoneExpires(t *testing.T) {
@@ -608,6 +885,270 @@ func TestCancelUnknownTaskDoesNotCallUpstream(t *testing.T) {
 	}
 	if cancelCalled {
 		t.Fatal("expected unknown task not to reach upstream cancellation")
+	}
+}
+
+func TestCancelAndWaitOrReserveRejectsLateTask(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	cancelCalled := false
+
+	found, err := manager.CancelAndWaitOrReserve("late-task", func(_, _ string) error {
+		cancelCalled = true
+		return nil
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("reserve cancellation for late task: %v", err)
+	}
+	if !found {
+		t.Fatal("expected late task cancellation to be reserved")
+	}
+	if cancelCalled {
+		t.Fatal("expected unknown task not to reach upstream cancellation")
+	}
+	if err := manager.Add(testTask("late-task", "whisperx", "")); err == nil {
+		t.Fatal("expected late task admission to be rejected")
+	}
+}
+
+func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("running-reserved-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, time.Second)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case <-task.ResultChan:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancellation result")
+	}
+	select {
+	case result := <-cancelled:
+		t.Fatalf("cancellation returned before task cleanup: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	manager.mu.RLock()
+	trackedTask := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if trackedTask != task {
+		t.Fatal("expected running task to remain tracked until cleanup")
+	}
+
+	manager.completeTaskCleanup(task)
+	result := <-cancelled
+	if result.err != nil {
+		t.Fatalf("cancel and wait or reserve: %v", result.err)
+	}
+	if !result.found {
+		t.Fatal("expected running task cancellation to succeed")
+	}
+	manager.mu.RLock()
+	_, taskExists := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if taskExists {
+		t.Fatal("expected running task to be removed after cleanup")
+	}
+}
+
+func TestCancelAndWaitOrReserveUsesCleanupTimeoutWhenCancellationAlreadyRecorded(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("compensated-running-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+	manager.mu.Lock()
+	manager.recordCompletedCancellation(task.ID, task.Model, time.Now())
+	manager.mu.Unlock()
+	t.Cleanup(func() {
+		manager.completeTaskCleanup(task)
+	})
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, 50*time.Millisecond)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case result := <-cancelled:
+		if result.found {
+			t.Fatal("expected cleanup timeout not to report a new cancellation")
+		}
+		if !errors.Is(result.err, errTaskCleanupTimeout) {
+			t.Fatalf("expected cleanup timeout, got %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected cancellation to wait with a timeout instead of busy-looping")
+	}
+}
+
+func TestRepeatedUploadCancellationWaitsForCleanup(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("uploading-cleanup", "whisperx", "")
+	if err := manager.BeginUpload(task); err != nil {
+		t.Fatalf("begin upload: %v", err)
+	}
+
+	found, err := manager.Cancel(task.ID, nil)
+	if err != nil {
+		t.Fatalf("cancel upload: %v", err)
+	}
+	if !found {
+		t.Fatal("expected uploading task to be found")
+	}
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, time.Second)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case result := <-cancelled:
+		t.Fatalf("repeated cancellation returned before upload cleanup: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.completeTaskCleanup(task)
+	select {
+	case result := <-cancelled:
+		if result.err != nil {
+			t.Fatalf("wait for repeated upload cancellation: %v", result.err)
+		}
+		if !result.found {
+			t.Fatal("expected repeated upload cancellation to be idempotent")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for repeated upload cancellation cleanup")
+	}
+	manager.AbortUpload(task)
+}
+
+func TestCancelAndWaitStopsUploadingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	now := time.Now()
+	for i := 0; i < maxCancellationRetries; i++ {
+		id := fmt.Sprintf("retryable-upload-%d", i)
+		manager.recordRetryableCancellation(id, "whisperx", now.Add(time.Duration(i)*time.Second))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	body := newBlockingReadCloser()
+	task := &ASRTask{
+		ID:         "uploading-task",
+		Status:     StatusUploading,
+		Model:      "whisperx",
+		ResultChan: make(chan ASRTaskResult, 1),
+		Ctx:        ctx,
+		CancelFunc: cancel,
+		UploadBody: body,
+	}
+	if err := manager.BeginUpload(task); err != nil {
+		t.Fatalf("begin upload: %v", err)
+	}
+
+	server := &service{taskManager: manager}
+	copyResult := make(chan error, 1)
+	go func() {
+		err := server.copyAudioWithStorageReservation(io.Discard, body, task)
+		manager.completeTaskCleanup(task)
+		manager.AbortUpload(task)
+		copyResult <- err
+	}()
+	<-body.started
+
+	found, err := manager.CancelAndWait(task.ID, nil, time.Second)
+	if err != nil {
+		t.Fatalf("cancel uploading task: %v", err)
+	}
+	if !found {
+		t.Fatal("expected uploading task cancellation to succeed")
+	}
+	if err := <-copyResult; !errors.Is(err, errTaskCancelledDuringUpload) {
+		t.Fatalf("expected cancelled upload error, got %v", err)
+	}
+	if err := manager.CompleteUpload(task, transcriptionUpload{Model: "whisperx"}); !errors.Is(err, errTaskCancelledDuringUpload) {
+		t.Fatalf("expected cancelled upload queue admission to fail, got %v", err)
+	}
+	if manager.storedBytes != 0 {
+		t.Fatalf("expected cancelled upload storage to be released, got %d", manager.storedBytes)
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-upload-0"]; !exists {
+		t.Fatal("expected retryable cancellation record to be preserved")
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Evictable {
+		t.Fatal("expected completed upload cancellation record to be evictable")
+	}
+	manager.mu.RLock()
+	_, taskExists := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if taskExists {
+		t.Fatal("expected cancelled upload registration to be removed after cleanup")
+	}
+}
+
+func TestCompleteUploadAndCancelSynchronizeMetadataAccess(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	for i := 0; i < 32; i++ {
+		task := testTask(fmt.Sprintf("uploading-task-%d", i), "", "")
+		if err := manager.BeginUpload(task); err != nil {
+			t.Fatalf("begin upload %d: %v", i, err)
+		}
+		upload := transcriptionUpload{
+			Model:          "whisperx",
+			Level:          "large-v3",
+			Language:       "en",
+			ResponseFormat: "json",
+			Filename:       "audio.wav",
+		}
+
+		start := make(chan struct{})
+		completeResult := make(chan error, 1)
+		cancelResult := make(chan error, 1)
+		go func() {
+			<-start
+			completeResult <- manager.CompleteUpload(task, upload)
+		}()
+		go func() {
+			<-start
+			_, err := manager.Cancel(task.ID, nil)
+			cancelResult <- err
+		}()
+		close(start)
+
+		completeErr := <-completeResult
+		if completeErr != nil && !errors.Is(completeErr, errTaskCancelledDuringUpload) {
+			t.Fatalf("complete upload %d: %v", i, completeErr)
+		}
+		if err := <-cancelResult; err != nil {
+			t.Fatalf("cancel upload %d: %v", i, err)
+		}
+		manager.AbortUpload(task)
 	}
 }
 
@@ -702,7 +1243,7 @@ func TestTranscriptionUploadErrorResponseReturnsRequestEntityTooLarge(t *testing
 	if statusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, statusCode)
 	}
-	if message != "audio file exceeds 100 MiB limit" {
+	if message != "audio file exceeds 256 MiB limit" {
 		t.Fatalf("unexpected oversized upload message %q", message)
 	}
 }
@@ -989,6 +1530,13 @@ func TestFinishTaskMarksNonSuccessfulUpstreamStatusAsFailed(t *testing.T) {
 			if result.Err != nil {
 				t.Fatalf("expected upstream response to remain transferable, got %v", result.Err)
 			}
+			manager.mu.RLock()
+			trackedTask := manager.tasks[task.ID]
+			manager.mu.RUnlock()
+			if trackedTask != task {
+				t.Fatal("expected finished task to remain tracked until cleanup")
+			}
+			manager.completeTaskCleanup(task)
 		})
 	}
 }
@@ -1030,6 +1578,173 @@ func TestProcessTaskCancelsUpstreamAfterTransportFailure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for upstream cancellation")
 	}
+}
+
+func TestProcessTaskCancelsUpstreamAfterResponseBodyTimeout(t *testing.T) {
+	const taskID = "response-body-timeout"
+	cancelledTaskID := make(chan string, 1)
+	releaseResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+		<-releaseResponse
+	}))
+	defer func() {
+		releaseOnce.Do(func() {
+			close(releaseResponse)
+		})
+		upstreamServer.Close()
+	}()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	server := &service{
+		upstreams:            models,
+		client:               &http.Client{},
+		statusClient:         &http.Client{Timeout: time.Second},
+		transcriptionTimeout: 50 * time.Millisecond,
+	}
+	task := testTask(taskID, "whisperx", writeTestAudio(t, "response-body-timeout.wav"))
+
+	result := server.processTask(task)
+	if result.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, result.StatusCode)
+	}
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", result.Err)
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != taskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", taskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+}
+
+func TestProcessTaskCancelsUpstreamAfterResponseBodyFailure(t *testing.T) {
+	const taskID = "response-body-failure"
+	cancelledTaskID := make(chan string, 1)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		writer.Header().Set("Content-Length", "100")
+		writer.WriteHeader(http.StatusOK)
+		if _, err := writer.Write([]byte("incomplete")); err != nil {
+			t.Errorf("write partial response: %v", err)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	server := &service{
+		upstreams:    models,
+		client:       &http.Client{},
+		statusClient: &http.Client{Timeout: time.Second},
+	}
+	task := testTask(taskID, "whisperx", writeTestAudio(t, "response-body-failure.wav"))
+
+	result := server.processTask(task)
+	if result.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, result.StatusCode)
+	}
+	if result.Err == nil {
+		t.Fatal("expected response body read failure")
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != taskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", taskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+}
+
+func TestQueueWorkerContinuesAfterTranscriptionTimeout(t *testing.T) {
+	const timedOutTaskID = "timed-out-task"
+	const nextTaskID = "next-task"
+	cancelledTaskID := make(chan string, 1)
+	releaseTimedOutRequest := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseTimedOutRequest)
+		})
+	})
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel" {
+			cancelledTaskID <- request.Header.Get("X-Task-Id")
+			writer.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if request.Header.Get("X-Task-Id") == timedOutTaskID {
+			<-releaseTimedOutRequest
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if _, err := writer.Write([]byte(`{"text":"ok"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	models := map[string]upstream{
+		"whisperx": {url: upstreamServer.URL, model: "large-v3", token: "token"},
+	}
+	manager := NewTaskManager(2, maxAudioFileSize, models)
+	server := &service{
+		upstreams:            models,
+		client:               &http.Client{},
+		statusClient:         &http.Client{Timeout: time.Second},
+		transcriptionTimeout: 50 * time.Millisecond,
+		taskManager:          manager,
+		transcribeSem:        make(chan struct{}, 1),
+	}
+	server.startQueueWorkers(manager)
+
+	timedOutTask := testTask(timedOutTaskID, "whisperx", writeTestAudio(t, "timed-out.wav"))
+	nextTask := testTask(nextTaskID, "whisperx", writeTestAudio(t, "next.wav"))
+	if err := manager.Add(timedOutTask); err != nil {
+		t.Fatalf("add timed out task: %v", err)
+	}
+	if err := manager.Add(nextTask); err != nil {
+		t.Fatalf("add next task: %v", err)
+	}
+
+	result := <-timedOutTask.ResultChan
+	if result.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, result.StatusCode)
+	}
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", result.Err)
+	}
+	select {
+	case actualTaskID := <-cancelledTaskID:
+		if actualTaskID != timedOutTaskID {
+			t.Fatalf("expected cancelled task ID %q, got %q", timedOutTaskID, actualTaskID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream cancellation")
+	}
+	waitForTaskResult(t, nextTask)
+	releaseOnce.Do(func() {
+		close(releaseTimedOutRequest)
+	})
 }
 
 func TestTransportFailureAndExternalCancellationShareUpstreamRequest(t *testing.T) {
@@ -1128,7 +1843,7 @@ func TestTransportFailureAndExternalCancellationShareUpstreamRequest(t *testing.
 	if !manager.finishTask(task, result) {
 		t.Fatal("expected failed task to finish after compensating cancellation")
 	}
-	manager.releaseTaskStorage(task)
+	manager.completeTaskCleanup(task)
 }
 
 func TestCancelUpstreamPassesTaskID(t *testing.T) {
@@ -1228,6 +1943,35 @@ func (body *countingReadCloser) Close() error {
 	return nil
 }
 
+type blockingReadCloser struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (body *blockingReadCloser) Read(_ []byte) (int, error) {
+	body.startOnce.Do(func() {
+		close(body.started)
+	})
+	<-body.closed
+	return 0, os.ErrClosed
+}
+
+func (body *blockingReadCloser) Close() error {
+	body.closeOnce.Do(func() {
+		close(body.closed)
+	})
+	return nil
+}
+
 func writeTestAudio(t *testing.T, name string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
@@ -1302,6 +2046,9 @@ func TestLoadServiceEnvironmentValidAndDefaults(t *testing.T) {
 	if env.maxConcurrentUploads != 5 {
 		t.Fatalf("expected maxConcurrentUploads=5, got %d", env.maxConcurrentUploads)
 	}
+	if env.transcriptionTimeoutSeconds != defaultTranscriptionTimeoutSeconds {
+		t.Fatalf("expected default transcription timeout %d, got %d", defaultTranscriptionTimeoutSeconds, env.transcriptionTimeoutSeconds)
+	}
 }
 
 func TestLoadServiceEnvironmentRejectsInvalidValues(t *testing.T) {
@@ -1318,6 +2065,7 @@ func TestLoadServiceEnvironmentRejectsInvalidValues(t *testing.T) {
 			t.Fatal("expected error for int exceeding max limit")
 		}
 	})
+
 }
 
 func TestNewServiceFromEnvironmentValidation(t *testing.T) {
@@ -1438,8 +2186,9 @@ func TestSystemEndpoint(t *testing.T) {
 	defer upstreamServer.Close()
 
 	svc := &service{
-		whisperxEnabled: true,
-		funasrEnabled:   false,
+		whisperxEnabled:      true,
+		funasrEnabled:        false,
+		transcriptionTimeout: 25 * time.Minute,
 		upstreams: map[string]upstream{
 			"whisperx": {url: upstreamServer.URL, token: "token"},
 		},
@@ -1457,6 +2206,12 @@ func TestSystemEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"upstream_status":"available"`) {
 		t.Fatalf("unexpected system response: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"upload_limit_bytes":268435456`) {
+		t.Fatalf("expected upload limit in system response: %s", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "transcription_policy") {
+		t.Fatalf("expected no transcription policy in system response: %s", recorder.Body.String())
 	}
 }
 
@@ -1635,14 +2390,17 @@ func TestCancelTaskHandlerVariations(t *testing.T) {
 		}
 	})
 
-	t.Run("not_found", func(t *testing.T) {
+	t.Run("reserve_before_admission", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest(http.MethodPost, "/v1/tasks/cancel", nil)
 		c.Params = gin.Params{{Key: "id", Value: "nonexistent-task"}}
 		svc.cancelTask(c)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("expected 404, got %d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+		if err := svc.taskManager.Add(testTask("nonexistent-task", "whisperx", "")); err == nil {
+			t.Fatal("expected reserved task admission to be rejected")
 		}
 	})
 
@@ -1790,6 +2548,40 @@ func TestTranscribeHandler_UploadValidationAndErrors(t *testing.T) {
 			t.Fatalf("expected 429 when upload sem full, got %d", rec.Code)
 		}
 	})
+
+	t.Run("queued_task_timeout", func(t *testing.T) {
+		models := map[string]upstream{"whisperx": {}}
+		manager := NewTaskManager(10, maxAudioFileSize, models)
+		svc := &service{
+			uploadSem:            make(chan struct{}, 1),
+			upstreams:            models,
+			taskManager:          manager,
+			transcriptionTimeout: 20 * time.Millisecond,
+		}
+		req := newMultipartTranscriptionRequest(t, "audio content", map[string]string{
+			"model":   "whisperx",
+			"task_id": "queued-timeout",
+		})
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = req
+
+		svc.transcribe(c)
+
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("expected 504 for queued task timeout, got %d", rec.Code)
+		}
+		manager.mu.RLock()
+		_, taskExists := manager.tasks["queued-timeout"]
+		storedBytes := manager.storedBytes
+		manager.mu.RUnlock()
+		if taskExists {
+			t.Fatal("expected timed out task to be removed")
+		}
+		if storedBytes != 0 {
+			t.Fatalf("expected timed out task storage to be released, got %d", storedBytes)
+		}
+	})
 }
 
 func TestUpstreamStatusAndSystemHandlerEdgeCases(t *testing.T) {
@@ -1844,16 +2636,54 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 	tm := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 
 	now := time.Now()
-	for i := 0; i < maxCancelTombstones+10; i++ {
-		tm.recordCancelledTaskID(fmt.Sprintf("task-%d", i), "whisperx", false, now)
+	for i := 0; i < maxCancelTombstones; i++ {
+		if !tm.recordCancellationTombstone(fmt.Sprintf("task-%d", i), "whisperx", now) {
+			t.Fatalf("record cancellation %d", i)
+		}
+	}
+	if tm.recordCancellationTombstone("overflow-task", "whisperx", now) {
+		t.Fatal("expected cancellation capacity to preserve existing records")
 	}
 
 	tm.mu.Lock()
 	count := len(tm.cancelledTaskIDs)
+	_, firstRecordExists := tm.cancelledTaskIDs["task-0"]
 	tm.mu.Unlock()
 
-	if count > maxCancelTombstones {
-		t.Fatalf("expected max cancelledTaskIDs count <= %d, got %d", maxCancelTombstones, count)
+	if count != maxCancelTombstones {
+		t.Fatalf("expected %d cancelled task IDs, got %d", maxCancelTombstones, count)
+	}
+	if !firstRecordExists {
+		t.Fatal("expected unexpired cancellation record not to be evicted")
+	}
+
+	found, err := tm.CancelAndWaitOrReserve("another-task", nil, time.Second)
+	if found {
+		t.Fatal("expected full cancellation reservation not to report success")
+	}
+	if !errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected cancellation capacity error, got %v", err)
+	}
+
+	retryableOnlyManager := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	for i := 0; i < maxCancellationRetries; i++ {
+		retryableOnlyManager.recordRetryableCancellation(
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
+			now.Add(time.Duration(i)*time.Second))
+	}
+	retryableOnlyManager.recordRetryableCancellation(
+		"retryable-overflow-task",
+		"whisperx",
+		now.Add(maxCancellationRetries*time.Second))
+	if count := retryableOnlyManager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+	if _, exists := retryableOnlyManager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if _, exists := retryableOnlyManager.cancelledTaskIDs["retryable-overflow-task"]; !exists {
+		t.Fatal("expected newest retryable cancellation to be recorded")
 	}
 }
 
@@ -1962,6 +2792,3 @@ func TestTaskManagerReserveStorageAndPublishResult(t *testing.T) {
 	task.ResultChan <- ASRTaskResult{StatusCode: 200}
 	publishTaskResult(task, ASRTaskResult{StatusCode: 500})
 }
-
-
-
