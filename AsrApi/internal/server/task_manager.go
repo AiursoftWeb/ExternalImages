@@ -139,6 +139,9 @@ func (tm *TaskManager) BeginUpload(task *ASRTask) error {
 	if _, exists := tm.cancelledTaskIDs[task.ID]; exists {
 		return errTaskCancelledDuringUpload
 	}
+	if _, exists := tm.cancellationAttempts[task.ID]; exists {
+		return errTaskCancelledDuringUpload
+	}
 	if _, exists := tm.tasks[task.ID]; exists {
 		return fmt.Errorf("task %s already exists", task.ID)
 	}
@@ -177,12 +180,7 @@ func (tm *TaskManager) CompleteUpload(task *ASRTask, upload transcriptionUpload)
 }
 
 func (tm *TaskManager) AbortUpload(task *ASRTask) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	if currentTask := tm.tasks[task.ID]; currentTask == task &&
-		(task.Status == StatusUploading || task.Status == StatusCancelled) {
-		delete(tm.tasks, task.ID)
-	}
+	tm.completeTaskCleanup(task)
 }
 
 func (tm *TaskManager) Add(task *ASRTask) error {
@@ -194,6 +192,9 @@ func (tm *TaskManager) Add(task *ASRTask) error {
 	tm.pruneCancelledTaskIDs(time.Now())
 	if _, exists := tm.cancelledTaskIDs[task.ID]; exists {
 		return fmt.Errorf("task %s was recently cancelled", task.ID)
+	}
+	if _, exists := tm.cancellationAttempts[task.ID]; exists {
+		return fmt.Errorf("task %s cancellation is in progress", task.ID)
 	}
 	if _, exists := tm.tasks[task.ID]; exists {
 		return fmt.Errorf("task %s already exists", task.ID)
@@ -221,33 +222,40 @@ func (tm *TaskManager) Add(task *ASRTask) error {
 }
 
 func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID string) error) (bool, error) {
+	_, found, err := tm.cancel(id, cancelUpstreamFunc)
+	return found, err
+}
+
+func (tm *TaskManager) cancel(id string, cancelUpstreamFunc func(model, taskID string) error) (*ASRTask, bool, error) {
 	tm.mu.Lock()
 	tm.pruneCancelledTaskIDs(time.Now())
+	task, taskExists := tm.tasks[id]
 	if attempt, exists := tm.cancellationAttempts[id]; exists {
 		tm.mu.Unlock()
-		return waitForCancellationAttempt(attempt)
+		found, err := waitForCancellationAttempt(attempt)
+		return task, found, err
 	}
-	task, taskExists := tm.tasks[id]
 	if taskExists && task.Status == StatusCancelled {
 		tm.mu.Unlock()
-		return true, nil
+		return task, true, nil
 	}
 	if record, exists := tm.cancelledTaskIDs[id]; exists {
 		if record.Retryable {
 			attempt := tm.startCancellationAttempt(id)
 			tm.mu.Unlock()
-			return tm.retryCancellation(id, record, attempt, cancelUpstreamFunc)
+			found, err := tm.retryCancellation(id, record, attempt, cancelUpstreamFunc)
+			return task, found, err
 		}
 		tm.mu.Unlock()
-		return false, nil
+		return task, false, nil
 	}
 	if !taskExists {
 		tm.mu.Unlock()
-		return false, nil
+		return nil, false, nil
 	}
 	if task.Status == StatusCompleted || task.Status == StatusFailed {
 		tm.mu.Unlock()
-		return false, nil
+		return task, false, nil
 	}
 	prevStatus := task.Status
 	if prevStatus == StatusUploading || prevStatus == StatusPending {
@@ -255,7 +263,6 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		task.Status = StatusCancelled
 		if prevStatus == StatusPending {
 			tm.removePendingTask(task)
-			delete(tm.tasks, id)
 		}
 		if task.CancelFunc != nil {
 			task.CancelFunc()
@@ -269,11 +276,11 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		}
 		log.Printf("[Queue] Task %s is cancelled. Previous status: %s", id, prevStatus)
 		if prevStatus == StatusUploading {
-			return true, nil
+			return task, true, nil
 		}
 		tm.completeTaskCleanup(task)
 		publishTaskResult(task, cancelledTaskResult())
-		return true, nil
+		return task, true, nil
 	}
 
 	attempt := tm.startCancellationAttempt(id)
@@ -300,7 +307,6 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 		} else {
 			tm.recordRetryableCancellation(id, task.Model, time.Now())
 		}
-		delete(tm.tasks, id)
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
@@ -312,21 +318,17 @@ func (tm *TaskManager) Cancel(id string, cancelUpstreamFunc func(model, taskID s
 			Body:       []byte(`{"error":"failed to confirm upstream cancellation"}`),
 			Err:        cancelErr,
 		})
-		return true, cancelErr
+		return task, true, cancelErr
 	}
 
 	log.Printf("[Queue] Task %s is cancelled. Previous status: %s", id, prevStatus)
 	publishTaskResult(task, cancelledTaskResult())
-	return true, nil
+	return task, true, nil
 }
 
 func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, taskID string) error, cleanupTimeout time.Duration) (bool, error) {
-	tm.mu.RLock()
-	task := tm.tasks[id]
-	tm.mu.RUnlock()
-
-	found, err := tm.Cancel(id, cancelUpstreamFunc)
-	if !found || err != nil || task == nil {
+	task, found, err := tm.cancel(id, cancelUpstreamFunc)
+	if err != nil || task == nil {
 		return found, err
 	}
 
@@ -334,9 +336,9 @@ func (tm *TaskManager) CancelAndWait(id string, cancelUpstreamFunc func(model, t
 	defer timer.Stop()
 	select {
 	case <-task.cleanupDone:
-		return true, nil
+		return found, nil
 	case <-timer.C:
-		return true, errTaskCleanupTimeout
+		return found, errTaskCleanupTimeout
 	}
 }
 
@@ -385,13 +387,10 @@ func (tm *TaskManager) retryCancellation(id string, record cancellationRecord, a
 	}
 
 	tm.mu.Lock()
-	if currentRecord, exists := tm.cancelledTaskIDs[id]; exists {
-		if cancelErr == nil {
-			tm.recordCompletedCancellation(id, currentRecord.Model, time.Now())
-		} else {
-			currentRecord.ExpiresAt = time.Now().Add(cancelTombstoneTTL)
-			tm.cancelledTaskIDs[id] = currentRecord
-		}
+	if cancelErr == nil {
+		tm.recordCompletedCancellation(id, record.Model, time.Now())
+	} else {
+		tm.recordRetryableCancellation(id, record.Model, time.Now())
 	}
 	tm.finishCancellationAttempt(id, attempt, cancelErr)
 	tm.mu.Unlock()
@@ -490,9 +489,14 @@ func (tm *TaskManager) releaseTaskStorage(task *ASRTask) {
 }
 
 func (tm *TaskManager) completeTaskCleanup(task *ASRTask) {
-	removeTemporaryFile(task.TempFilePath)
-	tm.releaseTaskStorage(task)
 	task.cleanupOnce.Do(func() {
+		removeTemporaryFile(task.TempFilePath)
+		tm.releaseTaskStorage(task)
+		tm.mu.Lock()
+		if currentTask := tm.tasks[task.ID]; currentTask == task {
+			delete(tm.tasks, task.ID)
+		}
+		tm.mu.Unlock()
 		close(task.cleanupDone)
 	})
 }

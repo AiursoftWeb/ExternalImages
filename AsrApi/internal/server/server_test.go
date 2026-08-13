@@ -494,7 +494,7 @@ func TestConcurrentCancellationSharesUpstreamResult(t *testing.T) {
 	}
 }
 
-func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T) {
+func TestCancelRunningTaskRetainsTaskUntilCleanupWhenUpstreamCancellationFails(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	task := testTask("running-task", "whisperx", "")
 	if err := manager.Add(task); err != nil {
@@ -516,8 +516,8 @@ func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T)
 	manager.mu.RLock()
 	_, exists := manager.tasks[task.ID]
 	manager.mu.RUnlock()
-	if exists {
-		t.Fatal("expected task to be removed after cancellation failure")
+	if !exists {
+		t.Fatal("expected task to remain tracked until cleanup")
 	}
 	if task.Status != StatusCancelFailed {
 		t.Fatalf("expected status %q, got %q", StatusCancelFailed, task.Status)
@@ -580,6 +580,13 @@ func TestCancelRunningTaskRemovesTaskWhenUpstreamCancellationFails(t *testing.T)
 	if retryCalls != 2 {
 		t.Fatalf("expected confirmed cancellation not to call upstream, got %d calls", retryCalls)
 	}
+	manager.completeTaskCleanup(task)
+	manager.mu.RLock()
+	_, exists = manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if exists {
+		t.Fatal("expected task to be removed after cleanup")
+	}
 }
 
 func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *testing.T) {
@@ -640,9 +647,10 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	manager.mu.RLock()
 	_, taskExists := manager.tasks[task.ID]
 	manager.mu.RUnlock()
-	if taskExists {
-		t.Fatal("expected task to be removed after successful cancellation retry")
+	if !taskExists {
+		t.Fatal("expected task to remain tracked until cleanup")
 	}
+	manager.completeTaskCleanup(task)
 }
 
 func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testing.T) {
@@ -684,11 +692,11 @@ func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testi
 	trackedTask := manager.tasks[task.ID]
 	taskCount := len(manager.tasks)
 	manager.mu.RUnlock()
-	if trackedTask != nil {
-		t.Fatal("expected cancelled task to be removed")
+	if trackedTask != task {
+		t.Fatal("expected cancelled task to remain tracked until cleanup")
 	}
-	if taskCount != 0 {
-		t.Fatalf("expected no active tasks, got %d", taskCount)
+	if taskCount != 1 {
+		t.Fatalf("expected one task awaiting cleanup, got %d", taskCount)
 	}
 	if record := manager.cancelledTaskIDs[task.ID]; !record.Retryable || record.Evictable {
 		t.Fatal("expected failed cancellation to remain protected and retryable")
@@ -699,6 +707,7 @@ func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testi
 	if count := manager.retryableCancellationCount(); count != maxCancellationRetries {
 		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
 	}
+	manager.completeTaskCleanup(task)
 }
 
 func TestCompensatingCancellationRetriesRemainBounded(t *testing.T) {
@@ -729,6 +738,87 @@ func TestCompensatingCancellationRetriesRemainBounded(t *testing.T) {
 	}
 }
 
+func TestCancellationAttemptOwnsTaskIDAfterRetryRecordEviction(t *testing.T) {
+	testCases := []struct {
+		name      string
+		cancelErr error
+		retryable bool
+	}{
+		{name: "success", retryable: false},
+		{name: "failure", cancelErr: errors.New("upstream unavailable"), retryable: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			const taskID = "evicted-retry"
+			manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+			now := time.Now()
+			manager.recordRetryableCancellation(taskID, "whisperx", now)
+			for i := 1; i < maxCancellationRetries; i++ {
+				manager.recordRetryableCancellation(
+					fmt.Sprintf("retryable-task-%d", i),
+					"whisperx",
+					now.Add(time.Duration(i)*time.Second))
+			}
+
+			cancelStarted := make(chan struct{})
+			releaseCancel := make(chan struct{})
+			cancelled := make(chan error, 1)
+			go func() {
+				_, err := manager.Cancel(taskID, func(_, _ string) error {
+					close(cancelStarted)
+					<-releaseCancel
+					return testCase.cancelErr
+				})
+				cancelled <- err
+			}()
+			<-cancelStarted
+
+			manager.mu.Lock()
+			manager.recordRetryableCancellation(
+				"retryable-overflow",
+				"whisperx",
+				now.Add(maxCancellationRetries*time.Second))
+			_, recordExists := manager.cancelledTaskIDs[taskID]
+			_, attemptExists := manager.cancellationAttempts[taskID]
+			manager.mu.Unlock()
+			if recordExists {
+				t.Fatal("expected active retry record to be evicted")
+			}
+			if !attemptExists {
+				t.Fatal("expected cancellation attempt to remain active")
+			}
+			if err := manager.Add(testTask(taskID, "whisperx", "")); err == nil {
+				t.Fatal("expected queued task admission to reject an active cancellation attempt")
+			}
+			if err := manager.BeginUpload(testTask(taskID, "whisperx", "")); !errors.Is(err, errTaskCancelledDuringUpload) {
+				t.Fatalf("expected upload admission to reject an active cancellation attempt, got %v", err)
+			}
+
+			close(releaseCancel)
+			if err := <-cancelled; !errors.Is(err, testCase.cancelErr) {
+				t.Fatalf("expected cancellation error %v, got %v", testCase.cancelErr, err)
+			}
+			manager.mu.RLock()
+			record, restored := manager.cancelledTaskIDs[taskID]
+			_, attemptExists = manager.cancellationAttempts[taskID]
+			manager.mu.RUnlock()
+			if !restored {
+				t.Fatal("expected cancellation result to restore the evicted record")
+			}
+			if record.Retryable != testCase.retryable {
+				t.Fatalf("expected retryable=%t, got %+v", testCase.retryable, record)
+			}
+			if attemptExists {
+				t.Fatal("expected completed cancellation attempt to be removed")
+			}
+			if count := manager.retryableCancellationCount(); count > maxCancellationRetries {
+				t.Fatalf("expected at most %d retryable records, got %d", maxCancellationRetries, count)
+			}
+		})
+	}
+}
+
 func TestCancelledTaskIDCannotBeReusedDuringTombstoneTTL(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	cancelledTask := testTask("reused-task", "whisperx", "")
@@ -751,6 +841,7 @@ func TestCancelledTaskIDCannotBeReusedDuringTombstoneTTL(t *testing.T) {
 	if manager.finishTask(cancelledTask, ASRTaskResult{StatusCode: http.StatusOK}) {
 		t.Fatal("expected cancelled worker result not to be published")
 	}
+	manager.completeTaskCleanup(cancelledTask)
 }
 
 func TestCancelledTaskIDCanBeReusedAfterTombstoneExpires(t *testing.T) {
@@ -849,6 +940,12 @@ func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
 		t.Fatalf("cancellation returned before task cleanup: %+v", result)
 	case <-time.After(100 * time.Millisecond):
 	}
+	manager.mu.RLock()
+	trackedTask := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if trackedTask != task {
+		t.Fatal("expected running task to remain tracked until cleanup")
+	}
 
 	manager.completeTaskCleanup(task)
 	result := <-cancelled
@@ -857,6 +954,51 @@ func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
 	}
 	if !result.found {
 		t.Fatal("expected running task cancellation to succeed")
+	}
+	manager.mu.RLock()
+	_, taskExists := manager.tasks[task.ID]
+	manager.mu.RUnlock()
+	if taskExists {
+		t.Fatal("expected running task to be removed after cleanup")
+	}
+}
+
+func TestCancelAndWaitOrReserveUsesCleanupTimeoutWhenCancellationAlreadyRecorded(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("compensated-running-task", "whisperx", "")
+	if err := manager.Add(task); err != nil {
+		t.Fatalf("add running task: %v", err)
+	}
+	manager.waitForPendingTask(manager.queues["whisperx"])
+	manager.mu.Lock()
+	manager.recordCompletedCancellation(task.ID, task.Model, time.Now())
+	manager.mu.Unlock()
+	t.Cleanup(func() {
+		manager.completeTaskCleanup(task)
+	})
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, 50*time.Millisecond)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case result := <-cancelled:
+		if result.found {
+			t.Fatal("expected cleanup timeout not to report a new cancellation")
+		}
+		if !errors.Is(result.err, errTaskCleanupTimeout) {
+			t.Fatalf("expected cleanup timeout, got %v", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected cancellation to wait with a timeout instead of busy-looping")
 	}
 }
 
@@ -1388,6 +1530,13 @@ func TestFinishTaskMarksNonSuccessfulUpstreamStatusAsFailed(t *testing.T) {
 			if result.Err != nil {
 				t.Fatalf("expected upstream response to remain transferable, got %v", result.Err)
 			}
+			manager.mu.RLock()
+			trackedTask := manager.tasks[task.ID]
+			manager.mu.RUnlock()
+			if trackedTask != task {
+				t.Fatal("expected finished task to remain tracked until cleanup")
+			}
+			manager.completeTaskCleanup(task)
 		})
 	}
 }
@@ -1694,7 +1843,7 @@ func TestTransportFailureAndExternalCancellationShareUpstreamRequest(t *testing.
 	if !manager.finishTask(task, result) {
 		t.Fatal("expected failed task to finish after compensating cancellation")
 	}
-	manager.releaseTaskStorage(task)
+	manager.completeTaskCleanup(task)
 }
 
 func TestCancelUpstreamPassesTaskID(t *testing.T) {

@@ -54,9 +54,6 @@ func (tm *TaskManager) finishTask(task *ASRTask, result ASRTaskResult) bool {
 		task.Status = StatusCompleted
 		log.Printf("[Queue] Worker finished task %s. Result: Success", task.ID)
 	}
-	if currentTask := tm.tasks[task.ID]; currentTask == task {
-		delete(tm.tasks, task.ID)
-	}
 	return true
 }
 
