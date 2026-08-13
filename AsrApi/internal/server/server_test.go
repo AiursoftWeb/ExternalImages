@@ -253,7 +253,7 @@ func TestCancelPendingTaskReleasesQueueCapacityAndRemovesFile(t *testing.T) {
 	}
 }
 
-func TestCancelPendingTaskEvictsOldestPreCancellationWhenRecordsAreFull(t *testing.T) {
+func TestCancelPendingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	task := testTask("pending-task", "whisperx", "")
 	if err := manager.Add(task); err != nil {
@@ -263,10 +263,10 @@ func TestCancelPendingTaskEvictsOldestPreCancellationWhenRecordsAreFull(t *testi
 	now := time.Now()
 	for i := 0; i < maxCancelTombstones; i++ {
 		if !manager.recordCancelledTaskID(
-			fmt.Sprintf("reserved-task-%d", i),
-			"",
-			false,
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
 			true,
+			false,
 			now.Add(time.Duration(i)*time.Second)) {
 			t.Fatalf("record cancellation %d", i)
 		}
@@ -282,14 +282,17 @@ func TestCancelPendingTaskEvictsOldestPreCancellationWhenRecordsAreFull(t *testi
 	if task.Status != StatusCancelled {
 		t.Fatalf("expected task to be cancelled, got %q", task.Status)
 	}
+	if task.Ctx.Err() == nil {
+		t.Fatal("expected pending task context to be cancelled")
+	}
 	if _, exists := manager.tasks[task.ID]; exists {
 		t.Fatal("expected cancelled task to be removed")
 	}
-	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; exists {
-		t.Fatal("expected oldest pre-cancellation record to be evicted")
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; !exists {
+		t.Fatal("expected retryable cancellation record to be preserved")
 	}
-	if record := manager.cancelledTaskIDs[task.ID]; record.Evictable {
-		t.Fatal("expected real task cancellation record to be protected")
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Evictable {
+		t.Fatal("expected completed task cancellation record to be evictable")
 	}
 }
 
@@ -614,8 +617,8 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	if !exists || !record.Retryable {
 		t.Fatal("expected failed running-task cancellation to remain retryable")
 	}
-	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; exists {
-		t.Fatal("expected oldest non-retryable cancellation record to be evicted")
+	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; !exists {
+		t.Fatal("expected tombstones to be preserved while cancellation is retryable")
 	}
 
 	retryCalls := 0
@@ -632,6 +635,12 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	if retryCalls != 1 {
 		t.Fatalf("expected one upstream retry, got %d", retryCalls)
 	}
+	if _, exists := manager.cancelledTaskIDs["reserved-task-0"]; exists {
+		t.Fatal("expected oldest tombstone to be evicted after cancellation succeeds")
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; record.Retryable || !record.Evictable {
+		t.Fatal("expected successful cancellation retry to become an evictable tombstone")
+	}
 	manager.mu.RLock()
 	_, taskExists := manager.tasks[task.ID]
 	manager.mu.RUnlock()
@@ -640,7 +649,7 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	}
 }
 
-func TestCancelRunningTaskDoesNotStartWhenRetryableCancellationRecordsAreFull(t *testing.T) {
+func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	task := testTask("running-task", "whisperx", "")
 	if err := manager.Add(task); err != nil {
@@ -664,25 +673,31 @@ func TestCancelRunningTaskDoesNotStartWhenRetryableCancellationRecordsAreFull(t 
 	if !found {
 		t.Fatal("expected running task to be found")
 	}
-	if !errors.Is(err, errCancellationCapacity) {
-		t.Fatalf("expected cancellation capacity error, got %v", err)
+	if err == nil || errors.Is(err, errCancellationCapacity) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
 	}
-	if cancelCalls != 0 {
-		t.Fatalf("expected cancellation not to start without reserved state, got %d calls", cancelCalls)
+	if cancelCalls != 1 {
+		t.Fatalf("expected cancellation to reach upstream once, got %d calls", cancelCalls)
 	}
-	if task.Status != StatusRunning {
-		t.Fatalf("expected task to remain running, got %q", task.Status)
+	if task.Status != StatusCancelFailed {
+		t.Fatalf("expected task cancellation to remain retryable, got %q", task.Status)
+	}
+	if task.Ctx.Err() == nil {
+		t.Fatal("expected running task context to be cancelled")
 	}
 
 	manager.mu.RLock()
 	trackedTask := manager.tasks[task.ID]
 	taskCount := len(manager.tasks)
 	manager.mu.RUnlock()
-	if trackedTask != task {
-		t.Fatal("expected running task to remain tracked")
+	if trackedTask != nil {
+		t.Fatal("expected cancelled task to be removed")
 	}
-	if taskCount != 1 {
-		t.Fatalf("expected only the active task to remain tracked, got %d", taskCount)
+	if taskCount != 0 {
+		t.Fatalf("expected no active tasks, got %d", taskCount)
+	}
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Retryable || record.Evictable {
+		t.Fatal("expected failed cancellation to remain protected and retryable")
 	}
 }
 
@@ -817,13 +832,13 @@ func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
 	}
 }
 
-func TestCancelAndWaitStopsUploadingTaskWhenPreCancellationRecordsAreFull(t *testing.T) {
+func TestCancelAndWaitStopsUploadingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	now := time.Now()
 	for i := 0; i < maxCancelTombstones; i++ {
-		id := fmt.Sprintf("reserved-upload-%d", i)
-		if !manager.recordCancelledTaskID(id, "", false, true, now.Add(time.Duration(i)*time.Second)) {
-			t.Fatalf("record pre-cancellation %d", i)
+		id := fmt.Sprintf("retryable-upload-%d", i)
+		if !manager.recordCancelledTaskID(id, "whisperx", true, false, now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("record retryable cancellation %d", i)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -867,11 +882,11 @@ func TestCancelAndWaitStopsUploadingTaskWhenPreCancellationRecordsAreFull(t *tes
 	if manager.storedBytes != 0 {
 		t.Fatalf("expected cancelled upload storage to be released, got %d", manager.storedBytes)
 	}
-	if _, exists := manager.cancelledTaskIDs["reserved-upload-0"]; exists {
-		t.Fatal("expected oldest pre-cancellation record to be evicted")
+	if _, exists := manager.cancelledTaskIDs["retryable-upload-0"]; !exists {
+		t.Fatal("expected retryable cancellation record to be preserved")
 	}
-	if record := manager.cancelledTaskIDs[task.ID]; record.Evictable {
-		t.Fatal("expected uploading task cancellation record to be protected")
+	if record := manager.cancelledTaskIDs[task.ID]; !record.Evictable {
+		t.Fatal("expected completed upload cancellation record to be evictable")
 	}
 	manager.mu.RLock()
 	_, taskExists := manager.tasks[task.ID]
@@ -2338,8 +2353,8 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 			t.Fatalf("record protected cancellation %d", i)
 		}
 	}
-	if protectedManager.recordCancelledTaskID("new-pre-cancellation", "", false, true, now) {
-		t.Fatal("expected pre-cancellation not to evict protected records")
+	if !protectedManager.recordCancelledTaskID("new-pre-cancellation", "", false, true, now) {
+		t.Fatal("expected protected records not to consume tombstone capacity")
 	}
 	if _, exists := protectedManager.cancelledTaskIDs["protected-task-0"]; !exists {
 		t.Fatal("expected protected cancellation record not to be evicted")
@@ -2351,8 +2366,8 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 			t.Fatalf("record retryable cancellation %d", i)
 		}
 	}
-	if retryableOnlyManager.recordCancelledTaskID("retryable-overflow-task", "whisperx", true, false, now) {
-		t.Fatal("expected full retryable cancellation capacity to preserve existing records")
+	if !retryableOnlyManager.recordCancelledTaskID("retryable-overflow-task", "whisperx", true, false, now) {
+		t.Fatal("expected retryable cancellation state not to be limited by tombstone capacity")
 	}
 }
 
