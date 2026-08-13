@@ -261,15 +261,11 @@ func TestCancelPendingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) 
 	}
 
 	now := time.Now()
-	for i := 0; i < maxCancelTombstones; i++ {
-		if !manager.recordCancelledTaskID(
+	for i := 0; i < maxCancellationRetries; i++ {
+		manager.recordRetryableCancellation(
 			fmt.Sprintf("retryable-task-%d", i),
 			"whisperx",
-			true,
-			false,
-			now.Add(time.Duration(i)*time.Second)) {
-			t.Fatalf("record cancellation %d", i)
-		}
+			now.Add(time.Duration(i)*time.Second))
 	}
 
 	found, err := manager.Cancel(task.ID, nil)
@@ -597,7 +593,7 @@ func TestCancelRunningTaskRemainsRetryableWhenCancellationRecordsAreFull(t *test
 	now := time.Now()
 	for i := 0; i < maxCancelTombstones; i++ {
 		id := fmt.Sprintf("reserved-task-%d", i)
-		if !manager.recordCancelledTaskID(id, "", false, true, now.Add(time.Duration(i)*time.Second)) {
+		if !manager.recordCancellationTombstone(id, "", now.Add(time.Duration(i)*time.Second)) {
 			t.Fatalf("record cancellation %d", i)
 		}
 	}
@@ -658,11 +654,9 @@ func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testi
 	manager.waitForPendingTask(manager.queues["whisperx"])
 
 	now := time.Now()
-	for i := 0; i < maxCancelTombstones; i++ {
+	for i := 0; i < maxCancellationRetries; i++ {
 		id := fmt.Sprintf("retryable-task-%d", i)
-		if !manager.recordCancelledTaskID(id, "whisperx", true, false, now) {
-			t.Fatalf("record retryable cancellation %d", i)
-		}
+		manager.recordRetryableCancellation(id, "whisperx", now.Add(time.Duration(i)*time.Second))
 	}
 
 	cancelCalls := 0
@@ -698,6 +692,40 @@ func TestCancelRunningTaskStartsWhenRetryableCancellationRecordsAreFull(t *testi
 	}
 	if record := manager.cancelledTaskIDs[task.ID]; !record.Retryable || record.Evictable {
 		t.Fatal("expected failed cancellation to remain protected and retryable")
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if count := manager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+}
+
+func TestCompensatingCancellationRetriesRemainBounded(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	now := time.Now()
+	for i := 0; i < maxCancellationRetries; i++ {
+		manager.recordRetryableCancellation(
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
+			now.Add(time.Duration(i)*time.Second))
+	}
+
+	upstreamErr := errors.New("upstream unavailable")
+	err := manager.runCompensatingCancellation("compensating-task", "whisperx", func() error {
+		return upstreamErr
+	})
+	if !errors.Is(err, upstreamErr) {
+		t.Fatalf("expected upstream cancellation error, got %v", err)
+	}
+	if count := manager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+	if _, exists := manager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if record := manager.cancelledTaskIDs["compensating-task"]; !record.Retryable {
+		t.Fatal("expected compensating cancellation failure to remain retryable")
 	}
 }
 
@@ -832,14 +860,60 @@ func TestCancelAndWaitOrReserveWaitsForRunningTaskCleanup(t *testing.T) {
 	}
 }
 
+func TestRepeatedUploadCancellationWaitsForCleanup(t *testing.T) {
+	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
+	task := testTask("uploading-cleanup", "whisperx", "")
+	if err := manager.BeginUpload(task); err != nil {
+		t.Fatalf("begin upload: %v", err)
+	}
+
+	found, err := manager.Cancel(task.ID, nil)
+	if err != nil {
+		t.Fatalf("cancel upload: %v", err)
+	}
+	if !found {
+		t.Fatal("expected uploading task to be found")
+	}
+
+	cancelled := make(chan struct {
+		found bool
+		err   error
+	}, 1)
+	go func() {
+		found, err := manager.CancelAndWaitOrReserve(task.ID, nil, time.Second)
+		cancelled <- struct {
+			found bool
+			err   error
+		}{found: found, err: err}
+	}()
+
+	select {
+	case result := <-cancelled:
+		t.Fatalf("repeated cancellation returned before upload cleanup: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.completeTaskCleanup(task)
+	select {
+	case result := <-cancelled:
+		if result.err != nil {
+			t.Fatalf("wait for repeated upload cancellation: %v", result.err)
+		}
+		if !result.found {
+			t.Fatal("expected repeated upload cancellation to be idempotent")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for repeated upload cancellation cleanup")
+	}
+	manager.AbortUpload(task)
+}
+
 func TestCancelAndWaitStopsUploadingTaskWhenRetryableCancellationRecordsAreFull(t *testing.T) {
 	manager := NewTaskManager(1, maxAudioFileSize, map[string]upstream{"whisperx": {}})
 	now := time.Now()
-	for i := 0; i < maxCancelTombstones; i++ {
+	for i := 0; i < maxCancellationRetries; i++ {
 		id := fmt.Sprintf("retryable-upload-%d", i)
-		if !manager.recordCancelledTaskID(id, "whisperx", true, false, now.Add(time.Duration(i)*time.Second)) {
-			t.Fatalf("record retryable cancellation %d", i)
-		}
+		manager.recordRetryableCancellation(id, "whisperx", now.Add(time.Duration(i)*time.Second))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	body := newBlockingReadCloser()
@@ -2414,11 +2488,11 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 
 	now := time.Now()
 	for i := 0; i < maxCancelTombstones; i++ {
-		if !tm.recordCancelledTaskID(fmt.Sprintf("task-%d", i), "whisperx", false, true, now) {
+		if !tm.recordCancellationTombstone(fmt.Sprintf("task-%d", i), "whisperx", now) {
 			t.Fatalf("record cancellation %d", i)
 		}
 	}
-	if tm.recordCancelledTaskID("overflow-task", "whisperx", false, true, now) {
+	if tm.recordCancellationTombstone("overflow-task", "whisperx", now) {
 		t.Fatal("expected cancellation capacity to preserve existing records")
 	}
 
@@ -2442,27 +2516,25 @@ func TestTaskManagerRecordAndPruneCancelledTaskIDs(t *testing.T) {
 		t.Fatalf("expected cancellation capacity error, got %v", err)
 	}
 
-	protectedManager := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
-	for i := 0; i < maxCancelTombstones; i++ {
-		if !protectedManager.recordCancelledTaskID(fmt.Sprintf("protected-task-%d", i), "whisperx", false, false, now) {
-			t.Fatalf("record protected cancellation %d", i)
-		}
-	}
-	if !protectedManager.recordCancelledTaskID("new-pre-cancellation", "", false, true, now) {
-		t.Fatal("expected protected records not to consume tombstone capacity")
-	}
-	if _, exists := protectedManager.cancelledTaskIDs["protected-task-0"]; !exists {
-		t.Fatal("expected protected cancellation record not to be evicted")
-	}
-
 	retryableOnlyManager := NewTaskManager(10, maxAudioFileSize, map[string]upstream{"whisperx": {}})
-	for i := 0; i < maxCancelTombstones; i++ {
-		if !retryableOnlyManager.recordCancelledTaskID(fmt.Sprintf("retryable-task-%d", i), "whisperx", true, false, now) {
-			t.Fatalf("record retryable cancellation %d", i)
-		}
+	for i := 0; i < maxCancellationRetries; i++ {
+		retryableOnlyManager.recordRetryableCancellation(
+			fmt.Sprintf("retryable-task-%d", i),
+			"whisperx",
+			now.Add(time.Duration(i)*time.Second))
 	}
-	if !retryableOnlyManager.recordCancelledTaskID("retryable-overflow-task", "whisperx", true, false, now) {
-		t.Fatal("expected retryable cancellation state not to be limited by tombstone capacity")
+	retryableOnlyManager.recordRetryableCancellation(
+		"retryable-overflow-task",
+		"whisperx",
+		now.Add(maxCancellationRetries*time.Second))
+	if count := retryableOnlyManager.retryableCancellationCount(); count != maxCancellationRetries {
+		t.Fatalf("expected %d retryable cancellations, got %d", maxCancellationRetries, count)
+	}
+	if _, exists := retryableOnlyManager.cancelledTaskIDs["retryable-task-0"]; exists {
+		t.Fatal("expected oldest retryable cancellation to be evicted")
+	}
+	if _, exists := retryableOnlyManager.cancelledTaskIDs["retryable-overflow-task"]; !exists {
+		t.Fatal("expected newest retryable cancellation to be recorded")
 	}
 }
 
