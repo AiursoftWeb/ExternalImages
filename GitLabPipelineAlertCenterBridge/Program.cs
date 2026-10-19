@@ -18,6 +18,7 @@ internal static class Program
         builder.Logging.ClearProviders();
         builder.Logging.AddJsonConsole();
         builder.Services.AddSingleton(settings);
+        builder.Services.AddSingleton<GitLabToken>();
         builder.Services.AddSingleton<GitLab>();
         builder.Services.AddAlertCenterSdk(settings.AlertCenterUrl, settings.AlertCenterKey);
         builder.Services.AddScoped<Reporter>();
@@ -27,15 +28,15 @@ internal static class Program
     }
 }
 
-internal sealed record Settings(string GitLabUrl, string GitLabToken, string AlertCenterUrl, string AlertCenterKey, string[] Groups)
+internal sealed record Settings(string GitLabUrl, string GitLabToken, string AlertCenterUrl, string AlertCenterKey, string[] Groups, string TokenDirectory)
 {
     internal static Settings Load()
     {
         static string Required(string name) => Environment.GetEnvironmentVariable(name) is { } value && !string.IsNullOrWhiteSpace(value)
             ? value.Trim() : throw new InvalidOperationException($"{name} is required.");
-        static string Endpoint(string name, string fallback)
+        static string Endpoint(string name)
         {
-            var value = Environment.GetEnvironmentVariable(name) ?? fallback;
+            var value = Required(name);
             if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
                 uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0)
                 throw new InvalidOperationException($"{name} must be an HTTP(S) endpoint without credentials, query or fragment.");
@@ -44,17 +45,20 @@ internal sealed record Settings(string GitLabUrl, string GitLabToken, string Ale
         var groups = Required("GITLAB_GROUPS").Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).Distinct(StringComparer.Ordinal).ToArray();
         if (groups.Length == 0 || groups.Any(x => x.StartsWith('/') || x.EndsWith('/') || x.Contains("//")))
             throw new InvalidOperationException("GITLAB_GROUPS must contain exact group paths.");
-        return new Settings(Endpoint("GITLAB_URL", "https://gitlab.aiursoft.com"), Required("GITLAB_ACCESS_TOKEN"),
-            Endpoint("ALERTCENTER_URL", "https://alertcenter.aiursoft.com"), Required("ALERTCENTER_API_KEY"), groups);
+        return new Settings(Endpoint("GITLAB_URL"), Required("GITLAB_ACCESS_TOKEN"),
+            Endpoint("ALERTCENTER_URL"), Required("ALERTCENTER_API_KEY"), groups,
+            Environment.GetEnvironmentVariable("TOKEN_DIRECTORY") ?? "/data");
     }
 }
 
-internal sealed class Scanner(GitLab gitlab, IServiceScopeFactory scopes, ILogger<Scanner> log) : BackgroundService
+internal sealed class Scanner(GitLab gitlab, GitLabToken token, IServiceScopeFactory scopes, ILogger<Scanner> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Rotation failures must stop reporting rather than reuse a possibly revoked token.
+            await token.Refresh(stoppingToken);
             var complete = true;
             try
             {
