@@ -80,3 +80,14 @@ deploy_whisperx:
       changes:
         - .gitlab-ci.yml
         - WhisperX/**/*
+
+deploy_gitlab_pipeline_alert_center_bridge:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "gitlab_pipeline_alert_center_bridge"
+    CONTEXT: "./GitLabPipelineAlertCenterBridge"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - GitLabPipelineAlertCenterBridge/**/*
