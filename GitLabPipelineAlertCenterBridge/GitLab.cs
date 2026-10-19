@@ -20,22 +20,25 @@ internal sealed class GitLab : IDisposable
 {
     private readonly HttpClient http;
     private readonly Settings settings;
+    private readonly GitLabToken token;
 
-    public GitLab(Settings settings)
+    public GitLab(Settings settings, GitLabToken token)
     {
         this.settings = settings;
+        this.token = token;
         http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
         {
             BaseAddress = new Uri(settings.GitLabUrl + "/api/v4/"), Timeout = TimeSpan.FromSeconds(30)
         };
-        http.DefaultRequestHeaders.Add("PRIVATE-TOKEN", settings.GitLabToken);
     }
 
     private async Task<HttpResponseMessage> Get(string path, CancellationToken ct)
     {
         for (var attempt = 0; ; attempt++)
         {
-            var response = await http.GetAsync(path, ct);
+            using var request = new HttpRequestMessage(HttpMethod.Get, path);
+            request.Headers.Add("PRIVATE-TOKEN", token.Current);
+            var response = await http.SendAsync(request, ct);
             if (response.StatusCode != HttpStatusCode.TooManyRequests || attempt >= 2)
             {
                 if (!response.IsSuccessStatusCode)

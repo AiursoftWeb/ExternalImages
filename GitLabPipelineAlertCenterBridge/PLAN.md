@@ -1,6 +1,6 @@
 # GitLab Pipeline AlertCenter Bridge — proposed design
 
-Status: implementation submitted for review; deployment remains a separate stage.
+Status: implementation merged; configurable endpoints and automatic GitLab token rotation are being prepared for deployment.
 
 Run one continuously running container, `gitlab_pipeline_alert_center_bridge`,
 from ExternalImages. Observe company default-branch pipelines through GitLab's
@@ -23,12 +23,12 @@ need no CI changes, includes, installed tools, webhooks, or credentials.
   scope `aiursoft`, no other organization is monitored.
 - Monitor the overall top-level pipeline result, including build, test and deploy
   failures. Allowed failures whose overall pipeline succeeds do not start alerts.
-- Required secrets: `GITLAB_ACCESS_TOKEN` (read API) and
+- Required secrets: `GITLAB_ACCESS_TOKEN` (dedicated personal token with `read_api` and `self_rotate`) and
   `ALERTCENTER_API_KEY` (one dedicated application for the entire bridge).
-- Default endpoints: `https://gitlab.aiursoft.com` and
-  `https://alertcenter.aiursoft.com`; allow non-secret endpoint overrides for
-  isolated acceptance. Do not reuse the revoked CI reporting key.
-- No UI, incoming webhook, database, volume, or per-repository configuration.
+- Required endpoints: `GITLAB_URL` and `ALERTCENTER_URL`; no company-specific defaults.
+  Do not reuse the revoked CI reporting key.
+- No UI, incoming webhook, database, or per-repository configuration.
+  A writable `/data` volume stores the rotated GitLab credential only.
   Proposed initial intervals: pipeline scan and scope discovery every 60 seconds; thresholds 3 and 8 hours. Keep these as simple service defaults.
 
 ## Failure-duration policy
@@ -84,7 +84,7 @@ GitLab version. Cache data must never override fresh GitLab evidence.
 ## Memory and restart behavior
 
 Memory is disposable cache only: project discovery, fetched pipeline details and
-incident references. No local timer, checkpoint or persisted queue is required
+incident references. No failure timer, checkpoint or persisted queue is required
 for correctness. A cold start performs the same history scan as a warm process;
 restarts and downtime do not reset failure age. Run one replica with
 stop-before-start replacement to keep reporting simple.
@@ -154,3 +154,9 @@ Validation harnesses stay outside this repository; no test framework is added.
 
 API references: [Pipelines](https://docs.gitlab.com/api/pipelines/) and
 [Groups](https://docs.gitlab.com/api/groups/).
+
+## Credential rotation
+
+Follow NugetNinja: read the latest token from disk before using the initial environment token, self-rotate through GitLab, and atomically save the replacement. The long-running bridge rotates once every 24 hours; GitLab supplies its default expiration (normally one week). Keep one writer and stop-before-start deployment. The credential store records its endpoint to prevent reuse against a different server. No token or token prefix is logged.
+
+Persist a rotation intent before sending the non-idempotent request. An interrupted response or persistence failure stops reporting and requires a fresh credential; never retry a possibly revoked token, because GitLab reuse detection can revoke its successors. Disk parse errors do not fall back to the stale environment token. The credential volume does not persist pipeline timing. AlertCenter API keys have no self-rotation protocol in the current SDK and are managed separately.
