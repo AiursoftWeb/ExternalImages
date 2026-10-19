@@ -9,10 +9,18 @@ need no CI changes, includes, installed tools, webhooks, or credentials.
 
 ## Scope and configuration
 
-- Discover active projects owned by the `aiursoft` group and its subgroups.
+- Required scope: `GITLAB_GROUPS`, a comma-separated set of GitLab group paths.
+  Production sets `GITLAB_GROUPS=aiursoft`. Trim whitespace, remove duplicates,
+  and resolve each exact group path; do not use substring or prefix matching.
+  Missing/empty configuration or an invalid/inaccessible group fails validation;
+  never fall back to every project visible to the token.
+- Discover active projects owned by the configured groups and their subgroups;
+  deduplicate projects when configured groups overlap. Group ownership, not token
+  visibility, defines the monitoring boundary.
   Exclude shared-in projects, personal namespaces (including `anduin`), bot forks,
   archived projects, tags, MR pipelines, child pipelines, and non-default branches.
-  Verify ownership independently of what the token can access.
+  Verify ownership independently of what the token can access. With production
+  scope `aiursoft`, no other organization is monitored.
 - Monitor the overall top-level pipeline result, including build, test and deploy
   failures. Allowed failures whose overall pipeline succeeds do not start alerts.
 - Required secrets: `GITLAB_ACCESS_TOKEN` (read API) and
@@ -126,7 +134,9 @@ pipeline-alert loop.
    Keep the source and multi-stage Dockerfile in this directory. Follow adjacent
    ExternalImages image publication conventions for amd64/arm64.
 2. Validate against isolated GitLab responses and an isolated AlertCenter app:
-   company/personal isolation; no incident before 3h; Sev3 at 3h and Sev2 at 8h;
+   configured-group/personal isolation; comma parsing, whitespace, duplicates,
+   overlapping groups, empty/invalid groups and shared-in project exclusion;
+   no incident before 3h; Sev3 at 3h and Sev2 at 8h;
    one failure with no further builds; success/re-failure; out-of-order completion;
    same-pipeline retry; success between scans; cold/warm scans producing identical
    results; startup after 8h creating Sev2 directly; restarts before/after alert;
@@ -134,7 +144,8 @@ pipeline-alert loop.
    reconciliation without duplicate notifications. Use controlled time; no
    intentional company pipeline failures or production notifications.
 3. Review and publish the image, then submit the separate Box deployment change
-   with two secret references, one replica and health check. Deploy only after
+   with two secret references, explicit non-secret `GITLAB_GROUPS=aiursoft`,
+   one replica and health check. Deploy only after
    human review and verify real scan coverage before enabling notifications.
    Finish the old CI integration rollback independently.
 
