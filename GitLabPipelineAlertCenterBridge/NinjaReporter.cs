@@ -23,92 +23,108 @@ internal sealed class NinjaReporter(AlertCenterApiClient api, GitLab gitlab, Set
             if (incidents.Count >= result.TotalCount) break;
             if (result.Items.Count == 0) throw new InvalidOperationException("Incomplete AlertCenter pagination.");
         }
-        var candidates = (await gitlab.NinjaMergeRequests(project, ct)).ToHashSet();
-        // Re-read tracked requests even after closing/merging and after a process restart.
-        foreach (var incident in incidents.Where(Active))
+        foreach (var incident in incidents)
         {
-            var iid = (incident.Metadata["ninja"] as JObject)?.Value<long>("iid")
-                ?? throw new InvalidOperationException("Missing NugetNinja metadata.");
-            if (iid <= 0 || incident.Metadata.Value<string>("source") != $"{projectSource}:{iid}")
+            var iid = (incident.Metadata["ninja"] as JObject)?.Value<long>("iid");
+            var source = incident.Metadata.Value<string>("source");
+            if (source != projectSource && source != $"{projectSource}:{iid}")
                 throw new InvalidOperationException("Invalid NugetNinja source.");
-            candidates.Add(iid);
         }
-        foreach (var iid in candidates.Order())
+        var merged = await gitlab.LatestNinjaMerge(project, ct);
+        var boundary = merged?.MergedAt ?? DateTimeOffset.MinValue;
+        var pending = (await gitlab.NinjaMergeRequests(project, ct))
+            .Where(x => x.CreatedAt > boundary).OrderBy(x => x.CreatedAt).ThenBy(x => x.Iid).ToList();
+        var active = incidents.Where(Active).ToList();
+        // A successful merge recovers the repository, including incidents for deleted/replaced MRs.
+        foreach (var incident in active.Where(x => Since(x) < boundary).ToList())
         {
-            var source = $"{projectSource}:{iid}";
-            var existing = incidents.Where(x => x.Metadata.Value<string>("source") == source).ToList();
-            var mr = await gitlab.ReadMergeRequest(project, iid, ct);
-            if (mr.Iid != iid || mr.TargetProjectId != project.Id || mr.Author.Username != "nuget-ninja" ||
-                mr.CreatedAt == default || mr.CreatedAt > DateTimeOffset.UtcNow || string.IsNullOrWhiteSpace(mr.WebUrl) || string.IsNullOrWhiteSpace(mr.Sha))
-                throw new InvalidOperationException("Invalid NugetNinja merge request.");
-            if (mr.State == "merged")
+            if (await gitlab.LatestNinjaMerge(project, ct) != merged)
+                throw new InvalidOperationException("NugetNinja merge history changed during reconciliation.");
+            await api.MitigateIncidentAsync(incident.IncidentId, new MitigateIncidentRequest
             {
-                if (mr.MergedAt == null) throw new InvalidOperationException("Merged request has no merge time.");
-                foreach (var incident in existing.Where(Active))
-                    await api.MitigateIncidentAsync(incident.IncidentId, new MitigateIncidentRequest
-                    {
-                        Version = incident.Version, Reason = $"NugetNinja MR confirmed merged at {mr.MergedAt:O}: {mr.WebUrl}"
-                    }).WaitAsync(ct);
-                continue;
-            }
-            if (mr.State is not ("opened" or "closed" or "locked"))
-                throw new InvalidOperationException("Unknown merge request state.");
-            var age = DateTimeOffset.UtcNow - mr.CreatedAt;
-            if (age < TimeSpan.FromHours(24)) continue;
-            // Respect a human mitigation/resolution. Never recreate this MR's incident.
-            if (existing.Count > 0 && !existing.Any(Active)) continue;
-            if (existing.Count == 0 && mr.State != "opened") continue;
-            var files = await gitlab.ChangedFiles(project, iid, ct);
-            var pipeline = mr.HeadPipeline;
-            var currentPipeline = pipeline != null && pipeline.Sha == mr.Sha;
-            var jobs = currentPipeline && pipeline!.Status == "failed"
-                ? await gitlab.FailedJobs(project, pipeline.Id, ct) : [];
-            // The job lookup may race a refresh or merge. Never report its old head as current.
-            var latest = await gitlab.ReadMergeRequest(project, iid, ct);
-            if (latest != mr) throw new InvalidOperationException("Merge request changed during reconciliation.");
-            var snapshot = Snapshot(mr, currentPipeline, jobs);
-            snapshot["changedFiles"] = new JArray(files);
-            var level = age >= TimeSpan.FromDays(7) ? "sev2" : "sev3";
-            if (existing.Count == 0)
-            {
-                var title = $"NugetNinja compliance MR unmerged: {project.Name} !{iid}";
-                var content = $"NugetNinja automates project compliance. Timely merging of its changes is essential to maintaining compliance.\n\n" +
-                    $"Proposed change: {Limit(mr.Title, 300)}\nMR description: {Limit(mr.Description ?? "Not provided.", 600)}\nCreated: {mr.CreatedAt:O}\n" +
-                    $"Unmerged for {Math.Floor(age.TotalHours)} hours at observation ({DateTimeOffset.UtcNow:O}).\n" +
-                    $"Changed files (up to 10): {Limit(string.Join(", ", files), 600)}\n" +
-                    $"Observed merge status: {snapshot.Value<string>("summary")}\nMR: {mr.WebUrl}\n" +
-                    $"Pipeline: {(currentPipeline ? pipeline!.WebUrl : "No pipeline for the current MR head.")}\n" +
-                    string.Join("\n", jobs.Take(5).Select(x => $"Failed required job: {Limit(x.Name, 100)} ({x.FailureReason ?? "reason unavailable"}) — {x.WebUrl}")) +
-                    "\n\nOCE: investigate the blocker, repair the compliance change or its checks, and drive the MR to merge. " +
-                    "See the MR for live status and ninja metadata for the latest observed snapshot. Closing without merging does not confirm compliance recovery.";
-                await api.CreateIncidentAsync(new CreateIncidentRequest
-                {
-                    ReportId = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes(source)).AsSpan(0, 16)),
-                    Title = Limit(title, 200), Content = Limit(content, 4000), Level = level, OccurredAtUtc = mr.CreatedAt,
-                    Metadata = new JObject { ["source"] = source, ["ninjaProject"] = projectSource, ["ninja"] = snapshot }
-                }).WaitAsync(ct);
-                log.LogInformation("Created {Level} NugetNinja incident for project {ProjectId} MR {Iid}", level, project.Id, iid);
-                continue;
-            }
-            foreach (var incident in existing.Where(Active))
-            {
-                var current = incident;
-                if (level == "sev2" && current.Level is "sev3" or "sev4")
-                {
-                    await api.ChangeIncidentSeverityAsync(current.IncidentId, new ChangeIncidentSeverityRequest
-                    {
-                        Version = current.Version, Level = level,
-                        Reason = $"NugetNinja MR has remained unmerged for at least 7 days. {snapshot.Value<string>("summary")} MR: {mr.WebUrl}"
-                    }).WaitAsync(ct);
-                    current = (await api.GetIncidentAsync(current.IncidentId).WaitAsync(ct)).Incident;
-                }
-                if (Active(current) && !JToken.DeepEquals(current.Metadata["ninja"], snapshot))
-                    await api.PatchIncidentMetadataAsync(current.IncidentId, new PatchIncidentMetadataRequest
-                    {
-                        Version = current.Version, Property = "ninja", Value = snapshot
-                    }).WaitAsync(ct);
-            }
+                Version = incident.Version,
+                Reason = $"Repository compliance automation recovered: NugetNinja MR !{merged!.Iid} merged at {boundary:O}: {merged.WebUrl}"
+            }).WaitAsync(ct);
+            active.Remove(incident);
         }
+        // Human mitigation/resolution suppresses the repository episode until a later successful merge.
+        if (active.Count == 0 && incidents.Any(x => !Active(x) && Since(x) > boundary)) return;
+        var starts = active.Select(Since).Concat(pending.Select(x => x.CreatedAt)).ToList();
+        if (starts.Count == 0) return;
+        var since = starts.Min();
+        var age = DateTimeOffset.UtcNow - since;
+        if (since == default || age < TimeSpan.Zero) throw new InvalidOperationException("Invalid NugetNinja failure time.");
+        if (age < TimeSpan.FromHours(24)) return;
+        var mr = pending.Count == 0 ? null : await gitlab.ReadMergeRequest(project, pending[0].Iid, ct);
+        var snapshot = active.FirstOrDefault()?.Metadata["ninja"]?.DeepClone() as JObject ?? new JObject();
+        var files = new List<string>();
+        var jobs = new List<PipelineJob>();
+        var currentPipeline = false;
+        if (mr != null)
+        {
+            if (mr.Iid != pending[0].Iid || mr.TargetProjectId != project.Id || mr.Author.Username != "nuget-ninja" ||
+                mr.State != "opened" || mr.CreatedAt == default || mr.CreatedAt > DateTimeOffset.UtcNow || mr.CreatedAt != pending[0].CreatedAt || string.IsNullOrWhiteSpace(mr.Sha) || string.IsNullOrWhiteSpace(mr.WebUrl))
+                throw new InvalidOperationException("NugetNinja merge request changed during reconciliation.");
+            files = await gitlab.ChangedFiles(project, mr.Iid, ct);
+            currentPipeline = mr.HeadPipeline != null && mr.HeadPipeline.Sha == mr.Sha;
+            if (currentPipeline && mr.HeadPipeline!.Status == "failed") jobs = await gitlab.FailedJobs(project, mr.HeadPipeline.Id, ct);
+            if (await gitlab.ReadMergeRequest(project, mr.Iid, ct) != mr)
+                throw new InvalidOperationException("Merge request changed during reconciliation.");
+            snapshot = Snapshot(mr, currentPipeline, jobs);
+            snapshot["changedFiles"] = new JArray(files);
+        }
+        else snapshot["summary"] = "No open NugetNinja MR is currently visible. Closing or deleting a request does not confirm recovery; a subsequent successful NugetNinja merge is still required.";
+        snapshot["failedSince"] = since.ToString("O");
+        if (await gitlab.LatestNinjaMerge(project, ct) != merged)
+            throw new InvalidOperationException("NugetNinja merge history changed during reconciliation.");
+        if (active.Count == 0)
+        {
+            // Always create Sev3 first. An already-old episode is escalated on the next scan, never recreated.
+            var title = $"NugetNinja compliance stalled: {project.Name}";
+            var content = $"NugetNinja automates project compliance. Timely merging of its changes is essential to maintaining compliance.\n\n" +
+                $"Repository compliance stalled since {since:O} ({Math.Floor(age.TotalHours)} hours at observation {DateTimeOffset.UtcNow:O}).\n" +
+                $"Proposed change: {Limit(mr!.Title, 300)}\nMR description: {Limit(mr.Description ?? "Not provided.", 600)}\n" +
+                $"Changed files (up to 10): {Limit(string.Join(", ", files), 600)}\n" +
+                $"Observed merge status: {snapshot.Value<string>("summary")}\nMR: {mr.WebUrl}\n" +
+                $"Pipeline: {(currentPipeline ? mr.HeadPipeline!.WebUrl : "No pipeline for the current MR head.")}\n" +
+                string.Join("\n", jobs.Take(5).Select(x => $"Failed required job: {Limit(x.Name, 100)} ({x.FailureReason ?? "reason unavailable"}) — {x.WebUrl}")) +
+                "\n\nOCE: investigate the blocker and drive a NugetNinja compliance MR to merge in this repository. " +
+                "A subsequent successful NugetNinja merge recovers this incident, including a replacement MR. Closing/deleting alone does not. " +
+                "See ninja metadata for the latest observed snapshot.";
+            await api.CreateIncidentAsync(new CreateIncidentRequest
+            {
+                ReportId = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes(projectSource + ":" + since.ToString("O"))).AsSpan(0, 16)),
+                Title = Limit(title, 200), Content = Limit(content, 4000), Level = "sev3", OccurredAtUtc = since,
+                Metadata = new JObject { ["source"] = projectSource, ["ninjaProject"] = projectSource, ["ninja"] = snapshot }
+            }).WaitAsync(ct);
+            log.LogInformation("Created Sev3 NugetNinja incident for project {ProjectId}", project.Id);
+            return;
+        }
+        foreach (var incident in active)
+        {
+            var current = incident;
+            if (age >= TimeSpan.FromDays(7) && current.Level is "sev3" or "sev4")
+            {
+                await api.ChangeIncidentSeverityAsync(current.IncidentId, new ChangeIncidentSeverityRequest
+                {
+                    Version = current.Version, Level = "sev2",
+                    Reason = $"Repository NugetNinja compliance has remained stalled since {since:O}, at least 7 days. {snapshot.Value<string>("summary")}"
+                }).WaitAsync(ct);
+                current = (await api.GetIncidentAsync(current.IncidentId).WaitAsync(ct)).Incident;
+            }
+            if (Active(current) && !JToken.DeepEquals(current.Metadata["ninja"], snapshot))
+                await api.PatchIncidentMetadataAsync(current.IncidentId, new PatchIncidentMetadataRequest
+                {
+                    Version = current.Version, Property = "ninja", Value = snapshot
+                }).WaitAsync(ct);
+        }
+    }
+
+    private static DateTimeOffset Since(IncidentDetails incident)
+    {
+        var state = incident.Metadata["ninja"] as JObject ?? throw new InvalidOperationException("Missing NugetNinja metadata.");
+        return DateTimeOffset.Parse(state.Value<string>("failedSince") ?? state.Value<string>("createdAt")
+            ?? throw new InvalidOperationException("Missing NugetNinja failure time."), System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static JObject Snapshot(MergeRequest mr, bool currentPipeline, List<PipelineJob> jobs)
