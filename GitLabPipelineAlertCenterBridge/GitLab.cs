@@ -24,6 +24,23 @@ internal sealed record BranchState(Pipeline Latest, long SuccessBoundary, DateTi
     internal string Fingerprint => $"{Latest.Id}:{Latest.Status}:{SuccessBoundary}:{FailedSince:O}:{FirstFailureId}";
 }
 
+internal sealed record MergeRequestAuthor(string Username);
+internal sealed record MergeRequestPipeline(long Id, string Status, string Sha,
+    [property: JsonPropertyName("web_url")] string WebUrl);
+internal sealed record MergeRequest(long Iid, string Title, string? Description, string State, string Sha, MergeRequestAuthor Author,
+    [property: JsonPropertyName("target_project_id")] long TargetProjectId,
+    [property: JsonPropertyName("created_at")] DateTimeOffset CreatedAt,
+    [property: JsonPropertyName("merged_at")] DateTimeOffset? MergedAt,
+    [property: JsonPropertyName("web_url")] string WebUrl,
+    [property: JsonPropertyName("detailed_merge_status")] string? DetailedMergeStatus,
+    [property: JsonPropertyName("has_conflicts")] bool HasConflicts, bool Draft,
+    [property: JsonPropertyName("head_pipeline")] MergeRequestPipeline? HeadPipeline);
+internal sealed record MergeRequestFile([property: JsonPropertyName("new_path")] string NewPath);
+internal sealed record PipelineJob(long Id, string Name, string Status,
+    [property: JsonPropertyName("allow_failure")] bool AllowFailure,
+    [property: JsonPropertyName("failure_reason")] string? FailureReason,
+    [property: JsonPropertyName("web_url")] string WebUrl);
+
 internal sealed class GitLab : IDisposable
 {
     private readonly HttpClient http;
@@ -107,6 +124,38 @@ internal sealed class GitLab : IDisposable
             }
         }
         return projects.Values.OrderBy(x => x.Id).ToList();
+    }
+
+    internal async Task<List<long>> NinjaMergeRequests(Project project, CancellationToken ct)
+    {
+        var result = new List<long>();
+        await foreach (var mr in Pages<MergeRequest>($"projects/{project.Id}/merge_requests?state=opened&scope=all&author_username=nuget-ninja", ct))
+        {
+            if (mr.Author.Username == "nuget-ninja" && mr.TargetProjectId == project.Id) result.Add(mr.Iid);
+        }
+        return result;
+    }
+
+    internal Task<MergeRequest> ReadMergeRequest(Project project, long iid, CancellationToken ct) =>
+        One<MergeRequest>($"projects/{project.Id}/merge_requests/{iid}", ct);
+
+    internal async Task<List<string>> ChangedFiles(Project project, long iid, CancellationToken ct)
+    {
+        var result = new List<string>();
+        await foreach (var file in Pages<MergeRequestFile>($"projects/{project.Id}/merge_requests/{iid}/diffs", ct))
+        {
+            result.Add(file.NewPath);
+            if (result.Count == 10) break;
+        }
+        return result;
+    }
+
+    internal async Task<List<PipelineJob>> FailedJobs(Project project, long pipelineId, CancellationToken ct)
+    {
+        var result = new List<PipelineJob>();
+        await foreach (var job in Pages<PipelineJob>($"projects/{project.Id}/pipelines/{pipelineId}/jobs?scope[]=failed&include_retried=false", ct))
+            if (job.Status == "failed" && !job.AllowFailure) result.Add(job);
+        return result;
     }
 
     internal async Task<BranchState?> Read(Project project, CancellationToken ct)

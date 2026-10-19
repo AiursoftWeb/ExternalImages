@@ -22,6 +22,7 @@ internal static class Program
         builder.Services.AddSingleton<GitLab>();
         builder.Services.AddAlertCenterSdk(settings.AlertCenterUrl, settings.AlertCenterKey);
         builder.Services.AddScoped<Reporter>();
+        builder.Services.AddScoped<NinjaReporter>();
         builder.Services.AddHostedService<Scanner>();
         await builder.Build().RunAsync();
         return 0;
@@ -66,6 +67,17 @@ internal sealed class Scanner(GitLab gitlab, GitLabToken token, IServiceScopeFac
                 var projects = await gitlab.Projects(stoppingToken);
                 foreach (var project in projects)
                 {
+                    try
+                    {
+                        await using var scope = scopes.CreateAsyncScope();
+                        await scope.ServiceProvider.GetRequiredService<NinjaReporter>().Reconcile(project, stoppingToken);
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        complete = false;
+                        log.LogWarning("Project {ProjectId} NugetNinja scan failed ({ErrorType}); retry on next scan", project.Id, ex.GetType().Name);
+                    }
                     try
                     {
                         var state = await gitlab.Read(project, stoppingToken);
