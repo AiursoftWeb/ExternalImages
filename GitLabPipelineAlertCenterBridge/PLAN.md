@@ -1,6 +1,6 @@
 # GitLab Pipeline AlertCenter Bridge — proposed design
 
-Status: design for review; no implementation or deployment in this change.
+Status: implementation submitted for review; deployment remains a separate stage.
 
 Run one continuously running container, `gitlab_pipeline_alert_center_bridge`,
 from ExternalImages. Observe company default-branch pipelines through GitLab's
@@ -29,8 +29,7 @@ need no CI changes, includes, installed tools, webhooks, or credentials.
   `https://alertcenter.aiursoft.com`; allow non-secret endpoint overrides for
   isolated acceptance. Do not reuse the revoked CI reporting key.
 - No UI, incoming webhook, database, volume, or per-repository configuration.
-  Proposed initial intervals: pipeline scan every 60 seconds, discovery every
-  10 minutes; thresholds 3 and 8 hours. Keep these as simple service defaults.
+  Proposed initial intervals: pipeline scan and scope discovery every 60 seconds; thresholds 3 and 8 hours. Keep these as simple service defaults.
 
 ## Failure-duration policy
 
@@ -128,7 +127,7 @@ pipeline-alert loop.
 
 ## Proposed implementation and acceptance stages
 
-1. After design approval, implement a .NET Worker using the existing supported
+1. Implement a .NET Worker using the existing supported
    company .NET version, HttpClient, and AlertCenter SDK. Do not invoke the old
    count-based `ci report` command: this service uses duration, not failure count.
    Keep the source and multi-stage Dockerfile in this directory. Follow adjacent
@@ -149,8 +148,9 @@ pipeline-alert loop.
    human review and verify real scan coverage before enabling notifications.
    Finish the old CI integration rollback independently.
 
-This plan does not authorize adding runtime code, deployment, new credentials,
-CI checks, or a test framework.
+The approved implementation adds the worker and its ordinary image publication
+job. Production deployment and credentials remain a separate reviewed stage.
+Validation harnesses stay outside this repository; no test framework is added.
 
 API references: [Pipelines](https://docs.gitlab.com/api/pipelines/) and
 [Groups](https://docs.gitlab.com/api/groups/).
