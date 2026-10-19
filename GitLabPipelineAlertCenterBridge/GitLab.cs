@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace PipelineBridge;
@@ -7,6 +8,13 @@ namespace PipelineBridge;
 internal sealed record Group(long Id, [property: JsonPropertyName("full_path")] string FullPath);
 internal sealed record Project(long Id, string Name, [property: JsonPropertyName("default_branch")] string? DefaultBranch,
     Namespace Namespace, bool Archived, [property: JsonPropertyName("forked_from_project")] object? ForkedFromProject);
+internal sealed record ProjectSettings(
+    [property: JsonPropertyName("builds_access_level")] string? BuildsAccessLevel,
+    [property: JsonPropertyName("ci_config_path")] string? CiConfigPath,
+    [property: JsonPropertyName("auto_devops_enabled")] bool? AutoDevOpsEnabled,
+    [property: JsonPropertyName("path_with_namespace")] string? PathWithNamespace);
+internal sealed record RepositoryBranch(RepositoryCommit Commit);
+internal sealed record RepositoryCommit(string Id);
 internal sealed record Namespace(string Kind, [property: JsonPropertyName("full_path")] string FullPath);
 internal sealed record Pipeline(long Id, string Status, string Ref, string Source,
     [property: JsonPropertyName("web_url")] string WebUrl,
@@ -103,6 +111,7 @@ internal sealed class GitLab : IDisposable
 
     internal async Task<BranchState?> Read(Project project, CancellationToken ct)
     {
+        if (!await HasCiConfiguration(project, ct)) return null;
         Pipeline? latest = null;
         DateTimeOffset? failedSince = null;
         long? firstFailureId = null;
@@ -121,6 +130,42 @@ internal sealed class GitLab : IDisposable
             if (failedSince == null || finished < failedSince) { failedSince = finished; firstFailureId = pipeline.Id; }
         }
         return latest == null ? null : new BranchState(latest, success, failedSince, firstFailureId);
+    }
+
+    private async Task<bool> HasCiConfiguration(Project project, CancellationToken ct)
+    {
+        var details = await One<ProjectSettings>($"projects/{project.Id}", ct);
+        if (details.BuildsAccessLevel == "disabled") return false;
+        if (details.AutoDevOpsEnabled == true) return true;
+        // Explicit configuration can live in another project or at an external URL.
+        // Its absence here does not establish retirement; retain normal monitoring.
+        if (!string.IsNullOrWhiteSpace(details.CiConfigPath)) return true;
+        // Resolve an accessible branch first: a missing project/ref is not a missing file.
+        var branch = await One<RepositoryBranch>($"projects/{project.Id}/repository/branches/{Uri.EscapeDataString(project.DefaultBranch!)}", ct);
+        try
+        {
+            using var response = await Get($"projects/{project.Id}/repository/files/.gitlab-ci.yml?ref={Uri.EscapeDataString(branch.Commit.Id)}", ct);
+            return true;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            // Reporter tokens cannot always see auto_devops_enabled. Verify the actual
+            // pipeline configuration source before treating a missing local file as retirement.
+            await foreach (var pipeline in Pages<Pipeline>($"projects/{project.Id}/pipelines?ref={Uri.EscapeDataString(project.DefaultBranch!)}&order_by=id&sort=desc", ct))
+            {
+                if (pipeline.Source is "merge_request_event" or "parent_pipeline") continue;
+                if (string.IsNullOrWhiteSpace(details.PathWithNamespace))
+                    throw new InvalidOperationException("Missing project path for configuration verification.");
+                var query = "{ project(fullPath: " + JsonSerializer.Serialize(details.PathWithNamespace) +
+                    ") { pipeline(id: \"gid://gitlab/Ci::Pipeline/" + pipeline.Id + "\") { configSource } } }";
+                var result = await One<JsonElement>("../graphql?query=" + Uri.EscapeDataString(query), ct);
+                if (result.TryGetProperty("errors", out _)) throw new InvalidOperationException("Cannot verify CI configuration source.");
+                var source = result.GetProperty("data").GetProperty("project").GetProperty("pipeline").GetProperty("configSource").GetString();
+                if (string.IsNullOrEmpty(source)) throw new InvalidOperationException("Missing CI configuration source.");
+                return source != "REPOSITORY_SOURCE";
+            }
+            return false;
+        }
     }
 
     public void Dispose() => http.Dispose();
