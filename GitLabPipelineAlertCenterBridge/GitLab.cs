@@ -126,14 +126,25 @@ internal sealed class GitLab : IDisposable
         return projects.Values.OrderBy(x => x.Id).ToList();
     }
 
-    internal async Task<List<long>> NinjaMergeRequests(Project project, CancellationToken ct)
+    internal async Task<List<MergeRequest>> NinjaMergeRequests(Project project, CancellationToken ct)
     {
-        var result = new List<long>();
+        var result = new List<MergeRequest>();
         await foreach (var mr in Pages<MergeRequest>($"projects/{project.Id}/merge_requests?state=opened&scope=all&author_username=nuget-ninja", ct))
         {
-            if (mr.Author.Username == "nuget-ninja" && mr.TargetProjectId == project.Id) result.Add(mr.Iid);
+            if (mr.Author.Username == "nuget-ninja" && mr.TargetProjectId == project.Id) result.Add(mr);
         }
         return result;
+    }
+
+    internal async Task<MergeRequest?> LatestNinjaMerge(Project project, CancellationToken ct)
+    {
+        var requests = await One<List<MergeRequest>>($"projects/{project.Id}/merge_requests?state=merged&scope=all&author_username=nuget-ninja&order_by=merged_at&sort=desc&per_page=1", ct);
+        var latest = requests.SingleOrDefault();
+        if (latest != null && (latest.Author.Username != "nuget-ninja" || latest.TargetProjectId != project.Id ||
+            latest.Iid <= 0 || latest.CreatedAt == default || latest.State != "merged" || latest.MergedAt == null ||
+            latest.MergedAt < latest.CreatedAt || latest.MergedAt > DateTimeOffset.UtcNow || string.IsNullOrWhiteSpace(latest.WebUrl)))
+            throw new InvalidOperationException("Invalid NugetNinja merge history.");
+        return latest;
     }
 
     internal Task<MergeRequest> ReadMergeRequest(Project project, long iid, CancellationToken ct) =>
