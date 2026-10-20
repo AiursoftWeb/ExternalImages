@@ -4,7 +4,7 @@ Copies hourly Cloudflare CDN response estimates into ClickHouse every 15 minutes
 
 Set `CLOUDFLARE_API_TOKEN` (zone-scoped Analytics Read), `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_HOSTNAME`, `CLICKHOUSE_URL`, `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`. Keep credentials in the deployment secret configuration. `CLICKHOUSE_DATABASE` defaults to `cloudflare`.
 
-Initialize once with `--init-schema` using schema-management credentials. Run the service with an account granted SELECT/INSERT on `http_hourly` and `sync_windows`; Grafana needs SELECT on `http_hourly_latest` and `sync_windows`. The normal service does not create or alter schema. `--once` synchronizes once and exits with a nonzero status on failure.
+Initialize once with `--init-schema` using schema-management credentials. Run the service with an account granted SELECT/INSERT on `http_hourly` and `sync_windows`; Grafana needs SELECT on `http_hourly_latest`, its underlying `http_hourly` table (the view uses invoker permissions), and `sync_windows`. The normal service does not create or alter schema. `--once` synchronizes once and exits with a nonzero status on failure.
 
 Defaults: `SYNC_INTERVAL_SECONDS=900`, `BACKFILL_DAYS=30`, `RECHECK_HOURS=48`, `INGESTION_LAG_HOURS=1`. Startup backfills available history; later cycles refresh the recent 48 hours and resume interrupted backfills using ClickHouse progress. Queries cover at most 24 hours each. History beyond the configured window is reported as a gap and cannot be recovered from this service. Run one replica. Retained rows have no automatic TTL.
 
