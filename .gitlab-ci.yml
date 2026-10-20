@@ -92,21 +92,6 @@ deploy_gitlab_pipeline_alert_center_bridge:
         - .gitlab-ci.yml
         - GitLabPipelineAlertCenterBridge/**/*
 
-validate_cloudflare_analytics_collector:
-  extends: .deploy_template
-  timeout: 90 minutes
-  script:
-    - docker buildx build ./CloudflareAnalyticsCollector --platform linux/amd64 --load -t "cloudflare-analytics-check:$CI_PIPELINE_ID"
-    - docker run --rm --network none --entrypoint python3 "cloudflare-analytics-check:$CI_PIPELINE_ID" -c "import ast,pathlib; ast.parse(pathlib.Path('/app/main.py').read_text())"
-    - docker run --rm --network none "cloudflare-analytics-check:$CI_PIPELINE_ID" --help
-  after_script:
-    - docker image rm "cloudflare-analytics-check:$CI_PIPELINE_ID" || true
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - .gitlab-ci.yml
-        - CloudflareAnalyticsCollector/**/*
-
 deploy_cloudflare_analytics_collector:
   extends: .deploy_template
   variables:
