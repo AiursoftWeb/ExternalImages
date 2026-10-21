@@ -102,3 +102,14 @@ deploy_cloudflare_analytics_collector:
       changes:
         - .gitlab-ci.yml
         - CloudflareAnalyticsCollector/**/*
+
+deploy_gitlab_ci_collector:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "gitlab_ci_collector"
+    CONTEXT: "./GitLabCiCollector"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - GitLabCiCollector/**/*
