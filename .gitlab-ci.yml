@@ -102,3 +102,14 @@ deploy_cloudflare_analytics_collector:
       changes:
         - .gitlab-ci.yml
         - CloudflareAnalyticsCollector/**/*
+
+deploy_http_error_alert_center_bridge:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "http_error_alert_center_bridge"
+    CONTEXT: "./HttpErrorAlertCenterBridge"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - HttpErrorAlertCenterBridge/**/*
