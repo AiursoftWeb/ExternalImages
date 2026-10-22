@@ -8,7 +8,7 @@ namespace HttpErrorBridge;
 
 internal sealed class Reporter(AlertCenterApiClient api, Settings settings, StateStore store, ILogger<Reporter> log, TimeProvider clock)
 {
-    internal async Task Scan(RecentLog recent, History history, long minute, DateTimeOffset cutoff, CancellationToken ct)
+    internal async Task<int> Scan(RecentLog recent, History history, long minute, DateTimeOffset cutoff, CancellationToken ct)
     {
         if (clock.GetUtcNow() - cutoff > TimeSpan.FromMinutes(3))
             throw new InvalidOperationException("Observation is stale.");
@@ -26,7 +26,11 @@ internal sealed class Reporter(AlertCenterApiClient api, Settings settings, Stat
         var byHost = active.GroupBy(x => x.Metadata.Value<string>("host") ?? throw new InvalidDataException("Missing incident host."))
             .ToDictionary(x => x.Key, x => x.Single(), StringComparer.Ordinal);
         var buckets = recent.Buckets.ToDictionary(x => (x.Host, x.Start), x => x.Counts);
-        foreach (var host in settings.Hosts)
+        var hosts = settings.AllHosts
+            ? recent.Buckets.Select(x => x.Host).Concat(byHost.Keys).Concat(store.PendingHosts).ToHashSet(StringComparer.Ordinal)
+            : settings.Hosts.ToHashSet(StringComparer.Ordinal);
+        store.Retain(hosts);
+        foreach (var host in hosts)
         {
             try
             {
@@ -42,6 +46,7 @@ internal sealed class Reporter(AlertCenterApiClient api, Settings settings, Stat
                 throw;
             }
         }
+        return hosts.Count;
     }
 
     internal async Task Reconcile(string host, Observation sample, Baseline? baseline, IncidentDetails? incident, long minute, CancellationToken ct)

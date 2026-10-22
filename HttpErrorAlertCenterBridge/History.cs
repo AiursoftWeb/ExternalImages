@@ -6,55 +6,62 @@ internal sealed class History(Settings settings)
 {
     internal const int Capacity = 8640;
     private HistoryData? _data;
+    private long? _baselineThrough;
     private readonly Dictionary<string, Baseline?> _baselines = new(StringComparer.Ordinal);
     private string PathName => Path.Combine(settings.DataDirectory, "history.json");
 
     internal async Task Refresh(RequestLog db, DateTimeOffset cutoff, CancellationToken ct)
     {
         var day = new DateTimeOffset(cutoff.UtcDateTime.Date, TimeSpan.Zero);
+        var through = day.ToUnixTimeSeconds();
+        var scope = string.Join(",", settings.Hosts);
         _data ??= File.Exists(PathName)
             ? JsonSerializer.Deserialize<HistoryData>(await File.ReadAllBytesAsync(PathName, ct))
                 ?? throw new InvalidDataException("Invalid history cache.")
             : new HistoryData();
-        var through = day.ToUnixTimeSeconds();
+        if (_data.Scope != scope || _data.Through < through - 30 * 86400L)
+            _data = new HistoryData { Scope = scope };
         if (_data.Through % 86400 != 0) throw new InvalidDataException("Invalid history boundary.");
         if (_data.Through > through) throw new InvalidDataException("History cache is ahead of the clock.");
-        var sameHosts = _data.Hosts.Count == settings.Hosts.Length && settings.Hosts.All(_data.Hosts.ContainsKey);
-        if (_data.Through == through && sameHosts && _baselines.Count == settings.Hosts.Length) return;
-        if (!sameHosts || _data.Through < through - 30 * 86400L)
-            _data = new HistoryData();
+        if (_baselineThrough == through) return;
         var from = Math.Max(_data.Through, through - 30 * 86400L);
-        foreach (var host in settings.Hosts)
+        var rows = from < through
+            ? await db.Read(DateTimeOffset.FromUnixTimeSeconds(from), day, 300, ct)
+            : [];
+        foreach (var (host, bins) in _data.Hosts.ToArray())
         {
-            if (!_data.Hosts.TryGetValue(host, out var bins))
-                _data.Hosts[host] = bins = new Counts[Capacity];
-            if (bins.Length != Capacity || bins.Any(x => x.Errors > x.Requests)) throw new InvalidDataException("Invalid history capacity.");
-            // Advance the ring, clearing overwritten days. Persist only after a complete query.
-            for (var slot = from / 300; slot < through / 300; slot++) bins[slot % Capacity] = default;
+            if (bins.Values.Any(x => x.Errors > x.Requests)) throw new InvalidDataException("Invalid history counts.");
+            foreach (var slot in bins.Keys.Where(x => x < through / 300 - Capacity || x >= from / 300).ToArray()) bins.Remove(slot);
+            if (bins.Count == 0) _data.Hosts.Remove(host);
         }
-        if (from < through)
+        foreach (var row in rows)
         {
-            var rows = await db.Read(DateTimeOffset.FromUnixTimeSeconds(from), day, 300, ct);
-            foreach (var row in rows) _data.Hosts[row.Host][row.Start / 300 % Capacity] = row.Counts;
+            if (!_data.Hosts.TryGetValue(row.Host, out var bins)) _data.Hosts[row.Host] = bins = [];
+            bins[row.Start / 300] = row.Counts;
         }
         _data.Through = through;
         Directory.CreateDirectory(settings.DataDirectory);
         StateStore.AtomicWrite(PathName, _data);
         _baselines.Clear();
-        foreach (var host in settings.Hosts) _baselines[host] = Calculate(_data.Hosts[host], day);
+        foreach (var (host, bins) in _data.Hosts) _baselines[host] = Calculate(bins, day);
+        _baselineThrough = through;
     }
 
     internal Baseline? For(string host) => _baselines.GetValueOrDefault(host);
 
-    internal static Baseline? Calculate(Counts[] bins, DateTimeOffset day)
+    internal static Baseline? Calculate(IReadOnlyDictionary<long, Counts> bins, DateTimeOffset day)
     {
         var end = day.ToUnixTimeSeconds() / 300;
-        var values = new List<double>(Capacity);
+        var slots = new HashSet<long>();
+        // Only windows touching a nonempty bucket can contribute a historical rate.
+        foreach (var bucket in bins.Keys)
+            for (var slot = bucket; slot <= bucket + 2; slot++)
+                if (slot >= end - Capacity + 2 && slot < end) slots.Add(slot);
+        var values = new List<double>(slots.Count);
         var days = new HashSet<long>();
-        // Three adjacent five-minute buckets form each historical fifteen-minute sample.
-        for (var slot = end - Capacity + 2; slot < end; slot++)
+        foreach (var slot in slots)
         {
-            var count = bins[slot % Capacity] + bins[(slot - 1) % Capacity] + bins[(slot - 2) % Capacity];
+            var count = bins.GetValueOrDefault(slot) + bins.GetValueOrDefault(slot - 1) + bins.GetValueOrDefault(slot - 2);
             if (count.Rate is not { } rate) continue;
             values.Add(rate);
             days.Add((slot * 300 + 299) / 86400);
@@ -67,7 +74,8 @@ internal sealed class History(Settings settings)
 
     internal sealed class HistoryData
     {
+        public string Scope { get; set; } = "";
         public long Through { get; set; }
-        public Dictionary<string, Counts[]> Hosts { get; set; } = new(StringComparer.Ordinal);
+        public Dictionary<string, Dictionary<long, Counts>> Hosts { get; set; } = new(StringComparer.Ordinal);
     }
 }

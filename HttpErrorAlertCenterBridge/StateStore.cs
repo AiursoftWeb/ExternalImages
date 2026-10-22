@@ -25,6 +25,13 @@ internal sealed class StateStore(Settings settings)
             ?? throw new InvalidDataException("Invalid pending state.")
         : new Dictionary<string, Guid>(StringComparer.Ordinal);
 
+    internal IEnumerable<string> PendingHosts => Pending.Keys;
+
+    internal void Retain(HashSet<string> hosts)
+    {
+        foreach (var host in _evidence.Keys.Where(x => !hosts.Contains(x)).ToArray()) _evidence.Remove(host);
+    }
+
     internal Guid? Find(string host) => Pending.TryGetValue(host, out var id) ? id : null;
 
     internal Guid Prepare(string host)

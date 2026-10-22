@@ -32,6 +32,7 @@ internal static class Program
 
 internal sealed record Settings(string Server, string[] Hosts, string ConnectionString, string AlertCenterUrl, string AlertCenterKey, string DataDirectory)
 {
+    internal bool AllHosts => Hosts is ["*"];
     internal string Source => $"http-error-bridge:v1:{Server}";
 
     internal static Settings Load()
@@ -43,8 +44,8 @@ internal sealed record Settings(string Server, string[] Hosts, string Connection
             throw new InvalidOperationException("SERVER_NAME must be a stable server identifier.");
         var hosts = Required("MONITORED_HOSTS").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
             .Select(x => x.ToLowerInvariant()).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        if (hosts.Length is 0 or > 500 || hosts.Any(x => Uri.CheckHostName(x) != UriHostNameType.Dns))
-            throw new InvalidOperationException("MONITORED_HOSTS must contain 1 to 500 exact DNS hostnames.");
+        if (!(hosts is ["*"]) && (hosts.Length is 0 or > 500 || hosts.Any(x => Uri.CheckHostName(x) != UriHostNameType.Dns)))
+            throw new InvalidOperationException("MONITORED_HOSTS must be * or contain 1 to 500 exact DNS hostnames.");
         var endpoint = Required("ALERTCENTER_URL");
         if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") ||
             uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0)
@@ -75,9 +76,9 @@ internal sealed class Scanner(IServiceScopeFactory scopes, StateStore store, His
                     throw new InvalidOperationException("Request log collection is stale.");
                 await history.Refresh(db, DateTimeOffset.FromUnixTimeSeconds(minute * 60), stoppingToken);
                 var reporter = scope.ServiceProvider.GetRequiredService<Reporter>();
-                await reporter.Scan(recent, history, minute, cutoff, stoppingToken);
+                var count = await reporter.Scan(recent, history, minute, cutoff, stoppingToken);
                 await File.WriteAllTextAsync(Program.HealthFile, now.ToString("O"), stoppingToken);
-                log.LogInformation("Scan completed for {Count} hosts on {Server}", settings.Hosts.Length, settings.Server);
+                log.LogInformation("Scan completed for {Count} hosts on {Server}", count, settings.Server);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex)
