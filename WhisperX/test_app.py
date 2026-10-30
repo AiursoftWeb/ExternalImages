@@ -39,11 +39,22 @@ def parameter(default=None, **_):
     return default
 
 
+class FakeWhisperModel:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def transcribe(self, audio_path, language=None, **kwargs):
+        fake_segment = types.SimpleNamespace(start=0.0, end=1.5, text="Hello world")
+        fake_info = types.SimpleNamespace(language="en")
+        return [fake_segment], fake_info
+
+
 def load_app_module():
-    module_names = ["whisperx", "fastapi", "fastapi.responses", "models_config"]
+    module_names = ["faster_whisper", "fastapi", "fastapi.responses", "models_config"]
     original_modules = {name: sys.modules.get(name) for name in module_names}
     original_token = os.environ.get("ASR_WHISPERX_TOKEN")
-    whisperx = types.ModuleType("whisperx")
+    faster_whisper = types.ModuleType("faster_whisper")
+    faster_whisper.WhisperModel = FakeWhisperModel
     fastapi = types.ModuleType("fastapi")
     fastapi.FastAPI = FakeFastAPI
     fastapi.File = parameter
@@ -59,7 +70,7 @@ def load_app_module():
     models_config.ensure_baked_model = lambda _: None
 
     try:
-        sys.modules["whisperx"] = whisperx
+        sys.modules["faster_whisper"] = faster_whisper
         sys.modules["fastapi"] = fastapi
         sys.modules["fastapi.responses"] = responses
         sys.modules["models_config"] = models_config

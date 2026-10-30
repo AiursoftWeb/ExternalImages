@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 
-import whisperx
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
@@ -34,7 +34,7 @@ class TranscriptionBusy(Exception):
 
 
 def load_model(name: str):
-    """Lazily load a whisperx model and cache it. Unknown or unloadable names
+    """Lazily load a faster-whisper model and cache it. Unknown or unloadable names
     raise so the caller can return a clear error instead of a 500."""
     ensure_baked_model(name)
 
@@ -45,16 +45,21 @@ def load_model(name: str):
         # Clear previous models to release VRAM/RAM before loading a new one
         MODEL_REGISTRY.clear()
         import gc
-        import torch
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
         try:
-            model = whisperx.load_model(
+            model = WhisperModel(
                 name,
-                os.getenv("WHISPERX_DEVICE", "cuda"),
+                device=os.getenv("WHISPERX_DEVICE", "cuda"),
                 compute_type=os.getenv("WHISPERX_COMPUTE_TYPE", "float16"),
+                download_root=os.getenv("HF_HOME", "/root/.cache/huggingface"),
+                local_files_only=True if os.getenv("HF_HUB_OFFLINE") == "1" else False,
             )
         except Exception as exc:
             raise ValueError(f"cannot load model '{name}': {exc}") from exc
@@ -76,16 +81,24 @@ def inference_worker(command_queue, result_queue):
                 "status": "model_loaded",
                 "model": command["model"],
             })
-            result = model.transcribe(
-                whisperx.load_audio(command["audio_path"]),
+            segments_iter, info = model.transcribe(
+                command["audio_path"],
                 language=command["language"] or None,
             )
-            text = " ".join(segment["text"].strip() for segment in result["segments"])
+            segments = [
+                {
+                    "start": round(s.start, 3),
+                    "end": round(s.end, 3),
+                    "text": s.text.strip(),
+                }
+                for s in segments_iter
+            ]
+            text = " ".join(s["text"] for s in segments)
             payload = {"text": text}
             if command["response_format"] != "json":
                 payload.update({
-                    "language": result.get("language"),
-                    "segments": result["segments"],
+                    "language": getattr(info, "language", None),
+                    "segments": segments,
                 })
             result_queue.put({
                 "task_id": task_id,
