@@ -30,6 +30,7 @@ RUN if [ "$USE_PYPI_MIRROR" = "true" ]; then \
         "fastapi==0.116.1" \
         "uvicorn[standard]==0.35.0" \
         "python-multipart==0.0.20" \
+        "av==13.1.0" \
         "faster-whisper==1.2.1" \
         "nvidia-cublas-cu12==12.8.4.1" \
         "nvidia-cudnn-cu12==9.10.2.21"

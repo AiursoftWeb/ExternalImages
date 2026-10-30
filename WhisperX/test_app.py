@@ -6,6 +6,8 @@ import threading
 import types
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 
 class FakeFastAPI:
     def middleware(self, _):
