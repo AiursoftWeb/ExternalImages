@@ -28,11 +28,17 @@ RUN aria2c --continue=true --max-connection-per-server=16 --max-tries=10 --min-s
         --dir=/tmp --out=torchaudio-2.6.0+cu124-cp312-cp312-linux_x86_64.whl \
         "https://download-r2.pytorch.org/whl/cu124/torchaudio-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl" \
     && echo "3e5ffa69606171c74f3e2b969785ead50b782ca657e746aaee1ee7cc88dcfc08  /tmp/torchaudio-2.6.0+cu124-cp312-cp312-linux_x86_64.whl" | sha256sum --check \
+    && aria2c --continue=true --max-connection-per-server=16 --max-tries=10 --min-split-size=1M --retry-wait=5 --split=16 \
+        --dir=/tmp --out=nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl \
+        "https://pypi.nvidia.com/nvidia-cublas-cu12/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl" \
+    && echo "2fc8da60df463fdefa81e323eef2e36489e1c94335b5358bcb38360adf75ac9b  /tmp/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl" | sha256sum --check \
     && pip install --timeout 600 --retries 10 --index-url https://download.pytorch.org/whl/cu124 \
         /tmp/torch-2.6.0+cu124-cp312-cp312-linux_x86_64.whl \
         /tmp/torchaudio-2.6.0+cu124-cp312-cp312-linux_x86_64.whl \
+        /tmp/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl \
     && rm /tmp/torch-2.6.0+cu124-cp312-cp312-linux_x86_64.whl \
-        /tmp/torchaudio-2.6.0+cu124-cp312-cp312-linux_x86_64.whl
+        /tmp/torchaudio-2.6.0+cu124-cp312-cp312-linux_x86_64.whl \
+        /tmp/nvidia_cublas_cu12-12.4.5.8-py3-none-manylinux2014_x86_64.whl
 RUN if [ "$USE_PYPI_MIRROR" = "true" ]; then \
         PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple; \
     else \
