@@ -113,14 +113,3 @@ deploy_http_error_alert_center_bridge:
       changes:
         - .gitlab-ci.yml
         - HttpErrorAlertCenterBridge/**/*
-
-deploy_traffic_alert_center_bridge:
-  extends: .deploy_template
-  variables:
-    IMAGE_NAME: "traffic_alert_center_bridge"
-    CONTEXT: "./TrafficAlertCenterBridge"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "master"'
-      changes:
-        - .gitlab-ci.yml
-        - TrafficAlertCenterBridge/**/*
