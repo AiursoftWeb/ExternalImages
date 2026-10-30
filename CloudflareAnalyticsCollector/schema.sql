@@ -16,6 +16,19 @@ ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMM(hour)
 ORDER BY (zone_id, hostname, hour);
 
+CREATE TABLE IF NOT EXISTS {database}.http_daily_uniques
+(
+    zone_id String,
+    hostname String,
+    date Date,
+    unique_ips UInt64,
+    collected_at DateTime64(6, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(date)
+ORDER BY (zone_id, hostname, date);
+
 CREATE TABLE IF NOT EXISTS {database}.sync_windows
 (
     zone_id String,
@@ -42,3 +55,15 @@ FROM
     GROUP BY zone_id, hostname, hour
 )
 WHERE tupleElement(latest, 5) = 1;
+
+CREATE VIEW IF NOT EXISTS {database}.http_daily_uniques_latest AS
+SELECT zone_id, hostname, date,
+    tupleElement(latest, 1) AS unique_ips,
+    tupleElement(latest, 2) AS collected_at
+FROM
+(
+    SELECT zone_id, hostname, date,
+        argMax(tuple(unique_ips, collected_at), version) AS latest
+    FROM {database}.http_daily_uniques
+    GROUP BY zone_id, hostname, date
+);

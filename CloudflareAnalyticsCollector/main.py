@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy Cloudflare hourly response estimates to ClickHouse using standard HTTP APIs."""
+"""Copy Cloudflare hourly response estimates and daily unique IPs to ClickHouse using standard HTTP APIs."""
 import argparse
 import datetime as dt
 import json
@@ -147,6 +147,31 @@ class Collector:
                          'response_bytes': response_bytes, 'requests': requests, 'sample_interval': sample})
         return rows
 
+    def fetch_daily_uniques(self, date_str):
+        filters = {
+            'date': date_str,
+            'clientRequestHTTPHost': self.hostname,
+            'requestSource': 'eyeball',
+        }
+        where = ','.join(key + ':' + json.dumps(value) for key, value in filters.items())
+        query = ('query {viewer {zones(filter:{zoneTag:' + json.dumps(self.zone) + '}) {'
+                 'httpRequestsAdaptiveGroups(limit:10000,filter:{' + where + '}) '
+                 '{dimensions {clientIP}}}}}')
+        payload = self.http('https://api.cloudflare.com/client/v4/graphql', json.dumps({'query': query}).encode(),
+                            {'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+        data = json.loads(payload)
+        if data.get('errors'):
+            raise CollectorError('Cloudflare GraphQL returned errors')
+        zones = data.get('data', {}).get('viewer', {}).get('zones', [])
+        if len(zones) != 1:
+            raise CollectorError('Cloudflare did not return the requested zone')
+        groups = zones[0]['httpRequestsAdaptiveGroups']
+        if not isinstance(groups, list):
+            raise CollectorError('Cloudflare result may be truncated or invalid')
+        if len(groups) >= 10000:
+            LOG.warning('Daily unique IPs reached limit of 10000 for date %s', date_str)
+        return len(groups)
+
     def sync(self, now=None):
         now = now or dt.datetime.now(UTC)
         end = now.replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=self.lag)
@@ -178,12 +203,31 @@ class Collector:
                 row.update(version=version, collected_at=collected)
             if rows:
                 self.sql(f'INSERT INTO {self.database}.http_hourly FORMAT JSONEachRow', rows)
+
+            # Daily unique IP collection for dates in this window
+            dates = sorted({(start + dt.timedelta(hours=offset)).strftime('%Y-%m-%d')
+                            for offset in range(int((stop - start).total_seconds() // 3600))})
+            unique_rows = []
+            for d in dates:
+                uniques = self.fetch_daily_uniques(d)
+                unique_rows.append({
+                    'zone_id': self.zone,
+                    'hostname': self.hostname,
+                    'date': d,
+                    'unique_ips': uniques,
+                    'collected_at': collected,
+                    'version': version,
+                })
+            if unique_rows:
+                self.sql(f'INSERT INTO {self.database}.http_daily_uniques FORMAT JSONEachRow', unique_rows)
+
             # Progress is committed only after every metric row was accepted.
             self.sql(f'INSERT INTO {self.database}.sync_windows FORMAT JSONEachRow', [{
                 'zone_id': self.zone, 'hostname': self.hostname, 'window_start': stamp(start),
                 'window_end': stamp(stop), 'collected_at': collected, 'version': version,
             }])
-            LOG.info('Synced %s to %s: %d hourly buckets', stamp(start), stamp(stop), observed_count)
+            LOG.info('Synced %s to %s: %d hourly buckets, %d daily unique records',
+                     stamp(start), stamp(stop), observed_count, len(unique_rows))
             start = stop
         if start == end:
             health = Path('/tmp/cloudflare-analytics-health')
