@@ -75,7 +75,7 @@ internal sealed class Scanner(IServiceScopeFactory scopes, StateStore store, Tim
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
                 catch (Exception ex) { failure = ex.GetType().Name; store.BreakTrafficSequences(); }
                 await scope.ServiceProvider.GetRequiredService<Reporter>().Scan(observation, failure, minute, ct);
-                if (observation != null)
+                if (observation != null && clock.GetUtcNow() - observation.Through <= TimeSpan.FromMinutes(3))
                     await File.WriteAllTextAsync(Program.HealthFile, clock.GetUtcNow().ToString("O"), ct);
                 else log.LogWarning("Request log collection unavailable ({ErrorType})", failure);
             }

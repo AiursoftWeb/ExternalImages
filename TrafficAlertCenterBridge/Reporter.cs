@@ -27,6 +27,8 @@ internal sealed class Reporter(AlertCenterApiClient api, Settings settings, Stat
             if (active.Count >= response.TotalCount) break;
             if (response.Items.Count == 0) throw new InvalidOperationException("Incomplete incident pagination.");
         }
+        if (observation != null && clock.GetUtcNow() - observation.Through > TimeSpan.FromMinutes(3))
+            throw new InvalidOperationException("Observation expired during incident query.");
         var current = active.Where(x => x.Status is not ("mitigated" or "resolved"))
             .GroupBy(x => x.Metadata.Value<string>("key") ?? throw new InvalidDataException("Missing incident key."))
             .ToDictionary(x => x.Key, x => x.Single(), StringComparer.Ordinal);
@@ -42,6 +44,8 @@ internal sealed class Reporter(AlertCenterApiClient api, Settings settings, Stat
         store.Retain(prefixes.Append("collection").ToHashSet(StringComparer.Ordinal));
         foreach (var prefix in prefixes)
         {
+            if (clock.GetUtcNow() - observation.Through > TimeSpan.FromMinutes(3))
+                throw new InvalidOperationException("Observation expired during reconciliation.");
             if (!Sources.Included(prefix, settings)) throw new InvalidDataException("Source scope changed while incidents remain pending.");
             ResetClosed(prefix, current.GetValueOrDefault(prefix));
             var sample = observation.For(prefix);
