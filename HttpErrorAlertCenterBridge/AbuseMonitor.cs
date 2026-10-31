@@ -139,6 +139,7 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
             {
                 var request = store.Report(prepared);
                 request.Level = "sev2";
+                request.Title = Title(findings, impacts);
                 request.Content = Describe(observation, findings, impacts);
                 request.Metadata!["evidence"] = Evidence(observation, findings, impacts);
                 prepared.Payload = JsonConvert.SerializeObject(request);
@@ -232,7 +233,7 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
                     await api.MitigateIncidentAsync(current.IncidentId, new MitigateIncidentRequest
                     {
                         Version = current.Version,
-                        Reason = "Ten fresh complete minutes below 12500 B/s and 150 requests/minute for every implicated source. Stopped traffic, including after blocking, is recovery. Final resolution remains manual."
+                        Reason = $"Abnormal activity on {settings.Server} has subsided. Every tracked source stayed below 12.5 kB/s and 150 requests/minute for ten complete minutes of fresh logs. This includes traffic stopping after a block; it does not verify whether a block was applied. The incident is mitigated; final resolution remains manual."
                     }).WaitAsync(ct);
                     state.Incident = null; state.Level = ""; state.Subjects.Clear(); store.BreakSequences();
                 }
@@ -252,7 +253,7 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
             var window = findings.Count == 0 ? 5 : findings.Max(x => x.Reason == "high request volume" ? 5 : x.Reason == "steady repeated downloads" ? 20 : 60);
             var report = new CreateIncidentRequest
             {
-                ReportId = Guid.NewGuid(), Level = impact.Any(x => x.Confirmed) ? "sev2" : "sev3", Title = $"Abnormal HTTP requests on {settings.Server}",
+                ReportId = Guid.NewGuid(), Level = impact.Any(x => x.Confirmed) ? "sev2" : "sev3", Title = Title(findings, impact),
                 Content = Describe(observation, findings, impact), OccurredAtUtc = observation.Through.AddMinutes(-window),
                 Metadata = new JObject { ["source"] = settings.AbuseSource, ["server"] = settings.Server,
                     ["scope"] = store.Scope, ["kind"] = "request-abuse", ["evidence"] = Evidence(observation, findings, impact) }
@@ -332,17 +333,96 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
         ["impact"] = JArray.FromObject(impacts.Where(x => x.Confirmed))
     };
 
+    private static int WindowMinutes(AbuseFinding finding) => finding.Reason == "high request volume" ? 5 :
+        finding.Reason == "steady repeated downloads" ? 20 : 60;
+
+    private static IEnumerable<AbuseFinding> Largest(IReadOnlyList<AbuseFinding> findings) => findings
+        .OrderByDescending(x => x.Sample.Window(WindowMinutes(x)).Bytes).ThenBy(x => x.Sample.Prefix, StringComparer.Ordinal);
+
+    private string Title(IReadOnlyList<AbuseFinding> findings, IReadOnlyList<AbuseImpact> impacts)
+    {
+        var primary = Largest(findings).FirstOrDefault();
+        var text = impacts.Any(x => x.Confirmed) ? $"HTTP activity with business impact on {settings.Server}" :
+            primary?.Reason == "high request volume" ? $"Suspected request flood on {settings.Server}" :
+            $"Suspected repeated downloads on {settings.Server}";
+        if (primary != null)
+        {
+            var window = primary.Sample.Window(WindowMinutes(primary));
+            text += primary.Reason == "high request volume"
+                ? FormattableString.Invariant($": {window.Requests:N0} requests in 5 min from {primary.Sample.Prefix}")
+                : FormattableString.Invariant($": {window.Mean / 1000:F0} kB/s from {primary.Sample.Prefix}");
+        }
+        if (findings.Count > 1) text += $" (+{findings.Count - 1} other sources)";
+        return text[..Math.Min(200, text.Length)];
+    }
+
+    // AlertCenter renders report content as plain text, in both the details page and email.
     private string Describe(AbuseObservation observation, IReadOnlyList<AbuseFinding> findings, IReadOnlyList<AbuseImpact> impacts)
     {
-        var sources = findings.Take(10).Select(x => FormattableString.Invariant(
-            $"{x.Sample.Prefix}: {x.Reason}; 20-minute mean {x.Sample.Window(20).Mean:F0} B/s, CV {x.Sample.Window(20).Cv:F3}; 5-minute requests {x.Sample.Window(5).Requests}, 5xx {x.Sample.Window(5).Errors}."));
-        var confirmed = impacts.Where(x => x.Confirmed).Select(x => FormattableString.Invariant(
-            $"{x.Host}: source 5xx {x.SourceErrors}/{x.SourceRequests}; other visitors p95 {x.OtherP95:F0} ms versus {x.BaselineP95:F0} ms baseline ({x.OtherRequests}/{x.BaselineRequests} samples)."));
-        return $"Server: {settings.Server}\nObservation through (UTC): {observation.Through:O}\n" + string.Join('\n', sources) +
-            "\nBusiness impact: " + (confirmed.Any() ? string.Join('\n', confirmed) : "not confirmed; reported as suspected abnormal activity") +
-            "\nIPv4 hosts and IPv6 /64 groups exclude private/reserved and explicitly allowlisted sources. Paths ignore query strings. " +
-            "Traffic patterns do not prove an actor's identity or a successful compromise. Automated recovery mitigates; final resolution is manual.";
+        var confirmed = impacts.Where(x => x.Confirmed).ToArray();
+        var text = new StringBuilder();
+        text.AppendLine(confirmed.Length > 0
+            ? $"HTTP activity on {settings.Server} coincides with service errors or slower responses for other visitors (sev2)."
+            : $"Suspected abnormal HTTP activity on {settings.Server} (sev3). Business impact has not been confirmed.");
+        if (Largest(findings).FirstOrDefault() is { } primary)
+        {
+            var window = primary.Sample.Window(WindowMinutes(primary));
+            text.AppendLine(FormattableString.Invariant($"Main source: {primary.Sample.Prefix}; {window.Requests:N0} requests and {window.Bytes / 1_000_000.0:F1} MB sent in {window.Minutes} min ({window.Mean / 1000:F1} kB/s average)."));
+        }
+        text.AppendLine("This observation does not establish a successful compromise or current bandwidth saturation.");
+        text.AppendLine();
+        text.AppendLine("What to check");
+        text.AppendLine($"Open {settings.Server}'s Grafana, Traffic V2, select Internet and the UTC time range below. Inspect the listed source addresses, sites and paths in the request logs. Check page speed and service errors before deciding whether to rate-limit or block it.");
+        text.AppendLine("Recovery: automatically mitigate after every tracked source stays below 12.5 kB/s and 150 requests/minute for ten fresh complete minutes, including after blocking. Missing logs do not count as recovery. Final resolution is manual.");
+        text.AppendLine();
+        text.AppendLine("Observed activity (UTC; window start is not the exact attack onset)");
+        foreach (var finding in Largest(findings).Take(2))
+        {
+            var window = finding.Sample.Window(WindowMinutes(finding));
+            var total = observation.Samples.Values.Sum(x => (double)x.Window(window.Minutes).Bytes);
+            var share = total > 0 ? FormattableString.Invariant($"; {100.0 * window.Bytes / total:F1}% of monitored public response bytes") : "";
+            var behavior = finding.Reason == "high request volume" ? "high request volume" :
+                finding.Reason == "steady repeated downloads" ? "repeated downloads with little variation" : "persistent repeated downloads";
+            text.AppendLine(FormattableString.Invariant($"{finding.Sample.Prefix}: {behavior}."));
+            text.AppendLine(FormattableString.Invariant($"  {observation.Through.AddMinutes(-window.Minutes):yyyy-MM-dd HH:mm} to {observation.Through:yyyy-MM-dd HH:mm} UTC ({window.Minutes} min): {window.Mean / 1000:F1} kB/s average, {window.Bytes / 1_000_000.0:F1} MB sent, {window.Requests:N0} requests{share}."));
+            if (finding.Reason != "high request volume")
+                text.AppendLine($"  Sustained activity in {window.ActiveMinutes}/{window.Minutes} minutes; repeated paths ignore query strings.");
+            if (finding.Paths is { } paths)
+            {
+                text.AppendLine($"  Leading paths by response bytes ({paths.Distinct} distinct site/path pairs):");
+                foreach (var path in paths.Top.OrderByDescending(x => x.Bytes).Take(2))
+                    text.AppendLine(FormattableString.Invariant($"    {Display(path.Host, 60)}{Display(path.Path.Split('?')[0], 80)}: {path.Requests:N0} requests, {path.Bytes / 1_000_000.0:F1} MB"));
+            }
+            else text.AppendLine("  Leading paths were not collected for this request-volume finding; inspect the source in Traffic V2.");
+        }
+        if (findings.Count > 2) text.AppendLine($"{findings.Count - 2} additional sources are listed in incident metadata > evidence.");
+        if (findings.Count == 0) text.AppendLine($"No newly confirmed source pattern in this scan. Observation through {observation.Through:yyyy-MM-dd HH:mm} UTC; tracked sources remain in incident metadata > evidence.");
+        if (confirmed.Length > 0)
+        {
+            text.AppendLine();
+            text.AppendLine("Business impact evidence (last 5 minutes)");
+            foreach (var impact in confirmed.Take(2))
+            {
+                text.AppendLine(FormattableString.Invariant($"{Display(impact.Host, 80)}: {impact.SourceErrors:N0}/{impact.SourceRequests:N0} requests from tracked sources returned 5xx; these account for {(impact.AllErrors > 0 ? 100.0 * impact.SourceErrors / impact.AllErrors : 0):F1}% of this site's 5xx."));
+                if (impact.OtherRequests >= 20 && impact.BaselineRequests >= 20 && impact.BaselineP95 > 0)
+                    text.AppendLine(FormattableString.Invariant($"  Other visitors' p95 response time: {impact.OtherP95 / 1000:F2} s, versus {impact.BaselineP95 / 1000:F2} s baseline ({impact.OtherRequests}/{impact.BaselineRequests} samples)."));
+            }
+        }
+        text.AppendLine();
+        text.AppendLine("Technical evidence: incident metadata > evidence contains source groups, paths, errors and impact measurements. kB/MB use decimal units. Public response share excludes private/reserved and allowlisted sources; it is not a percentage of link capacity.");
+        var content = text.ToString().TrimEnd();
+        // Keep the useful summary and action first even with long paths or multiple sources.
+        return content.Length <= 4000 ? content : content[..content.LastIndexOf('\n', 3900)] +
+            "\nFurther evidence is available in incident metadata > evidence.";
     }
+
+    private static string Display(string value, int limit)
+    {
+        var clean = new string(value.Where(c => !char.IsControl(c) && char.GetUnicodeCategory(c) !=
+            System.Globalization.UnicodeCategory.Format).ToArray());
+        return clean.Length <= limit ? clean : clean[..limit] + "…";
+    }
+
 }
 
 internal sealed class AbuseScanner(IServiceScopeFactory scopes, AbuseStore store, TimeProvider clock, ILogger<AbuseScanner> log) : BackgroundService
