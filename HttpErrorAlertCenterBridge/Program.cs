@@ -12,7 +12,7 @@ internal static class Program
     public static async Task<int> Main(string[] args)
     {
         if (args is ["--healthcheck"])
-            return File.Exists(HealthFile) && DateTime.UtcNow - File.GetLastWriteTimeUtc(HealthFile) < TimeSpan.FromMinutes(3) ? 0 : 1;
+            return Fresh(HealthFile) && (!Settings.AbuseIsEnabled || Fresh(AbuseScanner.HealthFile)) ? 0 : 1;
         var settings = Settings.Load();
         var builder = Host.CreateApplicationBuilder(args);
         builder.Logging.ClearProviders();
@@ -25,14 +25,31 @@ internal static class Program
         builder.Services.AddScoped<Reporter>();
         builder.Services.AddAlertCenterSdk(settings.AlertCenterUrl, settings.AlertCenterKey);
         builder.Services.AddHostedService<Scanner>();
-        await builder.Build().RunAsync();
+        if (settings.AbuseEnabled)
+        {
+            builder.Services.AddSingleton<AbuseStore>();
+            builder.Services.AddScoped<AbuseReporter>();
+            builder.Services.AddHostedService<AbuseScanner>();
+        }
+        using var host = builder.Build();
+        // Both scanners share the same process lease before either can perform API writes.
+        using var lease = host.Services.GetRequiredService<StateStore>().Acquire();
+        await host.RunAsync();
         return 0;
     }
+
+    private static bool Fresh(string path) => File.Exists(path) && DateTime.UtcNow >= File.GetLastWriteTimeUtc(path) &&
+        DateTime.UtcNow - File.GetLastWriteTimeUtc(path) < TimeSpan.FromMinutes(3);
 }
 
 internal sealed record Settings(string Server, string[] Hosts, string ConnectionString, string AlertCenterUrl, string AlertCenterKey, string DataDirectory)
 {
     internal bool AllHosts => Hosts is ["*"];
+    internal bool AbuseEnabled { get; init; }
+    internal System.Net.IPNetwork[] AbuseExcludedSources { get; init; } = [];
+    internal string AbuseSource => $"caddy-abuse:v1:{Server}";
+    internal static bool AbuseIsEnabled => Environment.GetEnvironmentVariable("HTTP_ABUSE_ENABLED") is not { Length: > 0 } value
+        ? false : bool.TryParse(value, out var enabled) ? enabled : throw new InvalidOperationException("Invalid HTTP_ABUSE_ENABLED.");
     internal string Source => $"http-error-bridge:v1:{Server}";
 
     internal static Settings Load()
@@ -51,7 +68,15 @@ internal sealed record Settings(string Server, string[] Hosts, string Connection
             uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0)
             throw new InvalidOperationException("ALERTCENTER_URL must be an HTTP(S) endpoint without credentials, query or fragment.");
         return new Settings(server, hosts, Required("CLICKHOUSE_CONNECTION_STRING"), endpoint.TrimEnd('/'),
-            Required("ALERTCENTER_API_KEY"), Environment.GetEnvironmentVariable("DATA_DIRECTORY") ?? "/data");
+            Required("ALERTCENTER_API_KEY"), Environment.GetEnvironmentVariable("DATA_DIRECTORY") ?? "/data")
+        {
+            AbuseEnabled = AbuseIsEnabled,
+            AbuseExcludedSources = (Environment.GetEnvironmentVariable("HTTP_ABUSE_EXCLUDED_SOURCE_CIDRS") ?? "")
+                .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => System.Net.IPNetwork.TryParse(x, out var network) &&
+                    (network.BaseAddress.AddressFamily != System.Net.Sockets.AddressFamily.InterNetworkV6 || network.PrefixLength <= 64)
+                    ? network : throw new InvalidOperationException("Invalid HTTP_ABUSE_EXCLUDED_SOURCE_CIDRS.")).ToArray()
+        };
     }
 }
 
@@ -59,8 +84,6 @@ internal sealed class Scanner(IServiceScopeFactory scopes, StateStore store, His
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // One replica per data volume. Never silently discard pending report identities.
-        using var lease = store.Acquire();
         while (!stoppingToken.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;

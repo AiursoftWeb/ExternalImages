@@ -7,7 +7,7 @@ namespace HttpErrorBridge;
 internal sealed record Bucket(string Host, long Start, Counts Counts);
 internal sealed record RecentLog(DateTimeOffset Latest, IReadOnlyList<Bucket> Buckets);
 
-internal sealed class RequestLog(Settings settings) : ClickhouseDbContext(new ClickhouseOptions
+internal sealed partial class RequestLog(Settings settings) : ClickhouseDbContext(new ClickhouseOptions
 {
     Enabled = true, ConnectionString = settings.ConnectionString
 })
