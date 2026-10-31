@@ -373,6 +373,8 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
         text.AppendLine();
         text.AppendLine("What to check");
         text.AppendLine($"Open {settings.Server}'s Grafana, Traffic V2, select Internet and the UTC time range below. Inspect the listed source addresses, sites and paths in the request logs. Check page speed and service errors before deciding whether to rate-limit or block it.");
+        text.AppendLine("If review confirms abuse, manually block the source IP/CIDR using existing Clean Traffic at the affected public ingress. Guide: https://gitlab.aiursoft.com/anduin/clean-traffic");
+        text.AppendLine("For persistent blocking, submit a reviewed MR adding the source to list in https://gitlab.aiursoft.com/anduin/ShameList-HackersIPs . Do not edit the GitHub mirror directly. After merge, verify GitMirror publication, run sudo -n /etc/cron.daily/auto-blacklist-update on the affected ingress, and verify set membership and firewall hits. Temporary ipset additions can be overwritten by refresh.");
         text.AppendLine("Recovery: automatically mitigate after every tracked source stays below 12.5 kB/s and 150 requests/minute for ten fresh complete minutes, including after blocking. Missing logs do not count as recovery. Final resolution is manual.");
         text.AppendLine();
         text.AppendLine("Observed activity (UTC; window start is not the exact attack onset)");
