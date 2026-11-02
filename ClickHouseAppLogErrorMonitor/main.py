@@ -26,7 +26,7 @@ def ident(value):
 
 
 def request(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
+    req = urllib.request.Request(url, data=data, headers={'User-Agent': 'Aiursoft-ClickHouseAppLogErrorMonitor/1.0', **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             if not 200 <= response.status < 300:
