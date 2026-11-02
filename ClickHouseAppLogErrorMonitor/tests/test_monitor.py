@@ -185,14 +185,40 @@ class Tests(unittest.TestCase):
         self.scan(0)
         self.assertEqual(x['Status'], 'resolved')
 
-    def test_pending_resolved_receipt_defers_recreation(self):
+    def test_pending_resolved_receipt_creates_recurrence_immediately(self):
         Mock.lost = True
         self.assertEqual(self.monitor.scan(), 1)
-        next(iter(Mock.incidents.values()))['Status'] = 'resolved'
-        self.scan(3)
-        self.assertEqual(len(Mock.incidents), 1)
-        self.scan(3)
+        old = next(iter(Mock.incidents.values()))
+        old['Status'] = 'resolved'
+        self.store.close()
+        self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs')
+        self.monitor.store = self.store
+        self.scan(15)
         self.assertEqual(len(Mock.incidents), 2)
+        new = next(x for x in Mock.incidents.values() if x['IncidentId'] != old['IncidentId'])
+        self.assertEqual((new['Status'], new['Level']), ('new', 'sev2'))
+        self.assertNotEqual(old['ReportId'], new['ReportId'])
+        self.assertEqual(old['Status'], 'resolved')
+        self.assertIsNone(self.store.pending('app'))
+        self.scan(15)
+        self.assertEqual(len(Mock.incidents), 2)
+        self.assertFalse(any('/reopen' in r[1] for r in Mock.requests))
+
+    def test_pending_resolved_receipt_respects_creation_threshold(self):
+        for count, level in ((0, None), (1, None), (2, None), (3, 'sev4'), (5, 'sev3')):
+            with self.subTest(count=count):
+                Mock.incidents = {}; Mock.requests = []; Mock.count = 3; Mock.lost = True
+                self.assertEqual(self.monitor.scan(), 1)
+                old = next(iter(Mock.incidents.values()))
+                old['Status'] = 'resolved'
+                self.scan(count)
+                active = [x for x in Mock.incidents.values() if x['Status'] != 'resolved']
+                self.assertEqual(len(active), 1 if level else 0)
+                if level:
+                    self.assertEqual(active[0]['Level'], level)
+                    self.assertNotEqual(active[0]['ReportId'], old['ReportId'])
+                self.assertEqual(old['Status'], 'resolved')
+                self.assertIsNone(self.store.pending('app'))
 
     def test_pending_recovers_when_table_disappears(self):
         Mock.lost = True
