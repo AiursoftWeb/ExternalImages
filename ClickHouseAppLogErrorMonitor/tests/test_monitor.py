@@ -113,6 +113,9 @@ class Tests(unittest.TestCase):
         self.assertEqual([main.severity(n) for n in (0,1,2,3,4,5,14,15,16)], [None,None,None,'sev4','sev4','sev3','sev3','sev2','sev2'])
 
     def test_diagnostic_payload_and_mutation_reasons(self):
+        self.monitor.public_url = 'https://clickhouse.example.com'
+        self.ch.samples = lambda *_: [{'EventTime': '2024-12-31 23:59:59', 'LogLevel': 5,
+                                      'Category': 'Example.Service', 'Message': 'Request failed', 'Exception': 'ExampleException: failure'}]
         for count, level, threshold in ((3, 'sev4', 3), (5, 'sev3', 5), (15, 'sev2', 15)):
             self.scan(count)
             posts = [json.loads(r[2]) for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents']
@@ -127,13 +130,60 @@ class Tests(unittest.TestCase):
                 self.assertNotIn('Message', context)
                 self.assertNotIn('Exception', context)
                 text = payload['Content']
+                self.assertEqual(payload['Title'], '[node] app: 3 errors in 15 minutes')
+                self.assertIn('ExampleException: failure', text)
+                self.assertIn('ClickHouse query page: https://clickhouse.example.com/play', text)
+                self.assertIn('FROM `AspNetCoreLogs`.`app`', text)
             else:
                 text = json.loads(Mock.requests[-1][2])['Reason']
-            self.assertIn('UTC window: [', text)
-            self.assertIn(f'Total: {count}', text)
-            self.assertIn(f'Trigger threshold: {threshold} ({level})', text)
+            self.assertIn('last 15 minutes', text)
+            self.assertIn(f'{count} errors', text)
+            self.assertIn('countIf(toInt32(LogLevel) = 4)', text)
+            self.assertIn("EventTime >= toDateTime64('2024-12-31 23:45:00.000000', 6, 'UTC')", text)
+            self.assertIn("EventTime < toDateTime64('2025-01-01 00:00:00.000000', 6, 'UTC')", text)
+            self.assertIn('AND toInt32(LogLevel) IN (4, 5)', text)
+            self.assertIn('LIMIT 20;', text)
+            self.assertLessEqual(len(text.encode()), 4000)
         self.scan(0)
-        self.assertIn('Error: 0; Critical: 0; Total: 0', json.loads(Mock.requests[-1][2])['Reason'])
+        self.assertIn('0 errors in the last 15 minutes (Error: 0; Critical: 0)', json.loads(Mock.requests[-1][2])['Reason'])
+
+    def test_samples_are_redacted_and_bounded(self):
+        self.ch.samples = lambda *_: [{'EventTime': '2024-12-31 23:59:59', 'LogLevel': 5,
+                                      'Message': 'password=secret123 Bearer jwt.value user@example.com https://example.com/path?token=abc',
+                                      'Exception': '😀堆栈' * 3000}] * 3
+        self.scan(3)
+        text = json.loads(next(r[2] for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents'))['Content']
+        self.assertLessEqual(len(text.encode()), 4000)
+        for value in ('secret123', 'jwt.value', 'user@example.com', 'token=abc'):
+            self.assertNotIn(value, text)
+        self.assertIn('LIMIT 20;', text)
+        self.assertTrue(text.endswith('...'))
+
+    def test_sample_failure_does_not_block_alert_or_resolution(self):
+        def unavailable(*_): raise RuntimeError('Optional log read failed')
+        self.ch.samples = unavailable
+        self.scan(3)
+        text = json.loads(next(r[2] for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents'))['Content']
+        self.assertIn('Samples unavailable', text)
+        self.scan(0)
+        self.assertEqual(next(iter(Mock.incidents.values()))['Status'], 'resolved')
+
+    def test_samples_use_server_side_limits_and_same_window(self):
+        queries = []
+        def query(sql, params=None):
+            queries.append(sql)
+            return [{'name': k} for k in ('Message', 'Exception', 'Category')] if 'system.columns' in sql else []
+        self.ch.query = query
+        self.ch.samples('strange`table', dt.datetime(2025, 1, 1, tzinfo=main.UTC))
+        sql = queries[-1]
+        self.assertIn('`strange\\`table`', sql)
+        self.assertIn('substringUTF8(toString(`Message`), 1, 500)', sql)
+        self.assertIn('LIMIT 3 SETTINGS max_execution_time=5', sql)
+        self.assertIn("EventTime < toDateTime64('2025-01-01 00:00:00.000000', 6, 'UTC')", sql)
+
+    def test_public_link_rejects_embedded_credentials(self):
+        for url in ('https://user:password@example.com', 'https://example.com?token=secret', 'javascript:alert(1)'):
+            with self.assertRaises(ValueError): main.Monitor(self.ch, self.api, self.store, 'node', 'AspNetCoreLogs', url)
 
     def test_invalid_diagnostic_counts_fail_closed(self):
         for row in ({'error': '2', 'critical': '1', 'total': '4'},
