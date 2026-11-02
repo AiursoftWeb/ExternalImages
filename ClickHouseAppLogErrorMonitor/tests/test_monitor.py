@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import uuid
 import sys
 from pathlib import Path
@@ -197,9 +198,63 @@ class Tests(unittest.TestCase):
         Mock.lost = True
         self.assertEqual(self.monitor.scan(), 1)
         Mock.tables = []
-        self.assertEqual(self.monitor.scan(), 0)
+        self.assertEqual(self.monitor.scan(), 1)
         self.assertIsNone(self.store.pending('app'))
         self.assertEqual(next(iter(Mock.incidents.values()))['Status'], 'new')
+
+    def test_missing_known_table_survives_restart_and_recovers(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        self.store.close()
+        self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs')
+        self.monitor.store = self.store
+        Mock.tables = ['other']
+        Mock.count = 0
+        self.assertEqual(self.monitor.scan(), 1)
+        self.assertEqual(incident['Status'], 'new')
+        self.assertEqual(self.store.known_names(), {'app', 'other'})
+        Mock.tables = ['app', 'other']
+        self.scan(0)
+        self.assertEqual(incident['Status'], 'resolved')
+
+    def test_missing_table_does_not_refresh_health_marker(self):
+        self.scan(3)
+        self.store.close()
+        marker = Path(self.tmp.name) / 'healthy'
+        marker.touch()
+        before = marker.stat().st_mtime_ns
+        Mock.tables = []
+        with patch.dict(main.os.environ, {'STATE_DIR': self.tmp.name, 'NODE_NAME': 'node',
+                                         'ALERTCENTER_URL': self.url, 'ALERTCENTER_API_KEY': 'secret',
+                                         'CLICKHOUSE_URL': self.url, 'CLICKHOUSE_DATABASE': 'AspNetCoreLogs'}), \
+             patch.object(sys, 'argv', ['main.py', '--once']), patch.object(main.signal, 'signal'):
+            self.assertEqual(main.main(), 1)
+        self.assertEqual(marker.stat().st_mtime_ns, before)
+        self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs')
+
+    def test_missing_known_table_without_incident(self):
+        self.scan(0)
+        self.assertFalse(Mock.incidents)
+        Mock.tables = []
+        self.assertEqual(self.monitor.scan(), 1)
+
+    def test_active_identities_restore_coverage_with_scope_isolation(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        with self.store.db:
+            self.store.db.execute('DELETE FROM known_tables')
+        for node, database in (('other-node', 'AspNetCoreLogs'), ('node', 'other-db')):
+            item = dict(incident, IncidentId=str(uuid.uuid4()), Metadata=dict(incident['Metadata'], node=node, database=database, table='foreign'))
+            Mock.incidents[item['IncidentId']] = item
+        Mock.tables = []
+        self.assertEqual(self.monitor.scan(), 1)
+        self.assertEqual(self.store.known_names(), {'app'})
+        self.assertEqual(incident['Status'], 'new')
+        with self.store.db:
+            self.store.db.execute('DELETE FROM known_tables')
+        incident['Status'] = 'resolved'
+        self.assertEqual(self.monitor.scan(), 0)
+        self.assertFalse(self.store.known_names())
 
     def test_duplicate_fail_closed(self):
         self.scan(3)

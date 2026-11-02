@@ -169,7 +169,15 @@ class Store:
         if not row:
             self.db.execute('INSERT INTO config VALUES (?)', (scope,))
         self.db.execute('CREATE TABLE IF NOT EXISTS pending (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS known_tables (name TEXT PRIMARY KEY)')
         self.db.commit()
+
+    def known_names(self):
+        return {row[0] for row in self.db.execute('SELECT name FROM known_tables')}
+
+    def remember(self, names):
+        with self.db:
+            self.db.executemany('INSERT OR IGNORE INTO known_tables VALUES (?)', ((name,) for name in names))
 
     def pending_names(self):
         return [row[0] for row in self.db.execute('SELECT name FROM pending')]
@@ -289,7 +297,14 @@ class Monitor:
         start = time.monotonic()
         now = now or dt.datetime.now(UTC)
         tables = self.ch.tables()
+        self.store.remember(tables)
         active = self.api.active()
+        active_names = {item['Metadata']['table'] for item in active
+                        if item['Metadata']['node'] == self.node and item['Metadata']['database'] == self.database}
+        self.store.remember(active_names | set(self.store.pending_names()))
+        missing = self.store.known_names() - set(tables)
+        for name in sorted(missing):
+            logging.error('Known table %r missing from discovery; monitoring coverage lost', name)
         failed = 0
         pending_failed = 0
         for name in tables:
@@ -305,17 +320,17 @@ class Monitor:
             except Exception as exc:
                 failed += 1
                 logging.error('Table %r failed (%s)', name, type(exc).__name__)
-        for name in set(self.store.pending_names()) - set(tables):
+        for name in missing:
             try:
                 self.process(name, None, active, now)
             except Exception as exc:
                 pending_failed += 1
                 logging.error('Pending incident failed (%s)', type(exc).__name__)
         elapsed = time.monotonic() - start
-        logging.info('Scan tables=%d succeeded=%d failed_tables=%d pending_failed=%d seconds=%.3f', len(tables), len(tables)-failed, failed, pending_failed, elapsed)
+        logging.info('Scan tables=%d succeeded=%d failed_tables=%d missing_tables=%d pending_failed=%d seconds=%.3f', len(tables), len(tables)-failed, failed, len(missing), pending_failed, elapsed)
         if elapsed >= 300:
             logging.warning('Scan exceeded 300 seconds')
-        return failed + pending_failed
+        return failed + len(missing) + pending_failed
 
 
 def main():
