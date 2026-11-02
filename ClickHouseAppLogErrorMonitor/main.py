@@ -258,7 +258,7 @@ class Monitor:
         count = counts['total']
         context, diagnostic_text = self.diagnostics(counts, now)
         if current and current['Status'] == 'resolved':
-            return
+            current = None
         if current is None and severity(count):
             payload = {'ReportId': str(uuid.uuid4()), 'Title': ('ClickHouse application errors: ' + name)[:200],
                        'Content': diagnostic_text, 'Level': severity(count), 'Context': context,
