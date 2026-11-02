@@ -4,6 +4,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import threading
@@ -23,6 +24,31 @@ def severity(count):
 
 def ident(value):
     return '`' + value.replace('\\', '\\\\').replace('`', '\\`') + '`'
+
+
+def investigation_queries(database, table, end):
+    end = end.astimezone(UTC)
+    start = end - dt.timedelta(minutes=15)
+    source = f'{ident(database)}.{ident(table)}'
+    where = (f"EventTime >= toDateTime64('{start:%Y-%m-%d %H:%M:%S.%f}', 6, 'UTC')\n"
+             f"  AND EventTime < toDateTime64('{end:%Y-%m-%d %H:%M:%S.%f}', 6, 'UTC')\n"
+             '  AND toInt32(LogLevel) IN (4, 5)')
+    count = ('SELECT countIf(toInt32(LogLevel) = 4) AS errors,\n'
+             '       countIf(toInt32(LogLevel) = 5) AS critical, count() AS total,\n'
+             '       min(EventTime) AS first_error, max(EventTime) AS last_error\n'
+             f'FROM {source}\nWHERE {where};')
+    details = f'SELECT *\nFROM {source}\nWHERE {where}\nORDER BY EventTime DESC\nLIMIT 20;'
+    return count, details, where
+
+
+def redact_sample(value):
+    text = str(value)
+    text = re.sub(r'(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+', '[redacted authorization]', text)
+    text = re.sub(r'(?i)([\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|cookie)[\w.-]*["\s]*[:=]\s*)("[^"]*"|\'[^\']*\'|[^\s;,]+)', r'\1[redacted]', text)
+    text = re.sub(r'(https?://)[^\s/@]+:[^\s/@]+@', r'\1[redacted]@', text)
+    text = re.sub(r'(https?://[^\s?#]+)[?#][^\s]*', r'\1?[redacted]', text)
+    text = re.sub(r'\b[A-Za-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[redacted email]', text)
+    return text.replace('`', "'")
 
 
 def request(url, data=None, headers=None):
@@ -92,6 +118,21 @@ class ClickHouse:
         if counts['error'] + counts['critical'] != counts['total']:
             raise ValueError('Inconsistent counts')
         return counts
+
+    def samples(self, table, end):
+        columns = self.query("SELECT name FROM system.columns WHERE database = {db:String} AND table = {table:String} FORMAT JSON", {'db': self.database, 'table': table})
+        names = {row['name'] for row in columns}
+        fields = ['EventTime', 'LogLevel']
+        fields += [f'substringUTF8(toString({ident(name)}), 1, {limit}) AS {ident(name)}'
+                   for name, limit in [('Category', 100), ('Message', 500), ('Exception', 800)] if name in names]
+        _, _, where = investigation_queries(self.database, table, end)
+        sql = (f"SELECT {', '.join(fields)} FROM {ident(self.database)}.{ident(table)} WHERE {where} "
+               'ORDER BY EventTime DESC LIMIT 3 SETTINGS max_execution_time=5, max_result_rows=3, '
+               "max_result_bytes=20000, result_overflow_mode='throw' FORMAT JSON")
+        rows = self.query(sql)
+        if len(rows) > 3 or any(not isinstance(row, dict) or 'EventTime' not in row or 'LogLevel' not in row for row in rows):
+            raise ValueError('Invalid log samples')
+        return rows
 
 
 class AlertCenter:
@@ -201,8 +242,12 @@ class Store:
 
 
 class Monitor:
-    def __init__(self, ch, api, store, node, database):
+    def __init__(self, ch, api, store, node, database, public_url=''):
         self.ch, self.api, self.store, self.node, self.database = ch, api, store, node, database
+        url = urllib.parse.urlsplit(public_url)
+        if public_url and (url.scheme not in ('https', 'http') or not url.netloc or url.username or url.password or url.query or url.fragment):
+            raise ValueError('ClickHouse public URL must not contain credentials, query or fragment')
+        self.public_url = public_url.rstrip('/')
 
     def identity(self, name):
         return {'source': SOURCE, 'node': self.node, 'database': self.database, 'table': name}
@@ -221,7 +266,7 @@ class Monitor:
             raise ValueError('Invalid incident state')
         return incident
 
-    def diagnostics(self, counts, now):
+    def diagnostics(self, name, counts, now, examples=False):
         end = now.astimezone(UTC)
         level = severity(counts['total'])
         threshold = {'sev4': 3, 'sev3': 5, 'sev2': 15}.get(level)
@@ -230,9 +275,34 @@ class Monitor:
                    'ErrorCount': counts['error'], 'CriticalCount': counts['critical'],
                    'TotalCount': counts['total'], 'TriggerThreshold': threshold,
                    'ThresholdLevel': level, 'Thresholds': {'sev4': 3, 'sev3': 5, 'sev2': 15}}
-        text = (f"UTC window: [{context['WindowStartUtc']}, {context['WindowEndUtc']})\n"
-                f"Error: {counts['error']}; Critical: {counts['critical']}; Total: {counts['total']}\n"
-                f"Trigger threshold: {threshold} ({level}); rules: sev4 >=3, sev3 >=5, sev2 >=15; resolve at 0.")
+        count_sql, detail_sql, _ = investigation_queries(self.database, name, end)
+        text = (f"{self.node} / {self.database}.{name}\n\n"
+                f"{counts['total']} errors in the last 15 minutes "
+                f"(Error: {counts['error']}; Critical: {counts['critical']}). Warnings excluded.\n"
+                f"Window (UTC, start inclusive / end exclusive): "
+                f"{end - dt.timedelta(minutes=15):%Y-%m-%d %H:%M:%S} to {end:%Y-%m-%d %H:%M:%S}.\n"
+                "Checked every 5 minutes; automatically closes when the 15-minute count is zero.\n\n")
+        if self.public_url:
+            text += f'ClickHouse query page: {self.public_url}/play\n\n'
+        text += (f'Verify the count and first/last error times:\n{count_sql}\n\n'
+                 f'Inspect messages and exception stacks (up to 20 rows):\n{detail_sql}')
+        if examples and counts['total']:
+            try:
+                rows = self.ch.samples(name, now)
+                samples = []
+                for row in rows:
+                    parts = [redact_sample(row.get(key, '')) for key in ('EventTime', 'LogLevel', 'Category', 'Message', 'Exception')]
+                    samples.append('\n'.join(part for part in parts if part))
+                snippet = '\n\n'.join(samples) or 'No sample rows remain in this window; use the query above.'
+            except Exception:
+                # Optional evidence must never turn a valid count into a missed alert.
+                snippet = 'Samples unavailable; use the query above. The error count was queried successfully.'
+            heading = '\n\nRecent examples (up to 3; truncated and sensitive fields masked):\n'
+            budget = 4000 - len(text.encode()) - len(heading.encode())
+            if budget > 4:
+                raw = snippet.encode()
+                snippet = snippet if len(raw) <= budget else raw[:budget-3].decode('utf-8', errors='ignore') + '...'
+                text += heading + snippet
         return context, text
 
     def process(self, name, counts, active, now):
@@ -257,11 +327,13 @@ class Monitor:
         if counts is None:
             return
         count = counts['total']
-        context, diagnostic_text = self.diagnostics(counts, now)
         if current and current['Status'] == 'resolved':
             current = None
+        wanted = severity(count)
+        examples = bool(wanted and (not current or int(wanted[-1]) < int(current['Level'][-1])))
+        context, diagnostic_text = self.diagnostics(name, counts, now, examples)
         if current is None and severity(count):
-            payload = {'ReportId': str(uuid.uuid4()), 'Title': ('ClickHouse application errors: ' + name)[:200],
+            payload = {'ReportId': str(uuid.uuid4()), 'Title': (f'[{self.node}] {name}: {count} errors in 15 minutes')[:200],
                        'Content': diagnostic_text, 'Level': severity(count), 'Context': context,
                        'OccurredAtUtc': now.astimezone(UTC).isoformat(), 'Metadata': self.identity(name)}
             self.store.save(name, payload)
@@ -352,7 +424,7 @@ def main():
     store = Store(os.environ.get('STATE_DIR', '/data'), node, database)
     ch = ClickHouse(os.environ.get('CLICKHOUSE_URL', 'http://clickhouse_clickhouse:8123'), database, os.environ.get('CLICKHOUSE_USER', 'default'), os.environ.get('CLICKHOUSE_PASSWORD', ''))
     api = AlertCenter(os.environ['ALERTCENTER_URL'], os.environ['ALERTCENTER_API_KEY'])
-    monitor = Monitor(ch, api, store, node, database)
+    monitor = Monitor(ch, api, store, node, database, os.environ.get('CLICKHOUSE_PUBLIC_URL', ''))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
