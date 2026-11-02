@@ -71,20 +71,26 @@ class ClickHouse:
         return names
 
     def count(self, table, end):
+        if end.tzinfo is None or end.utcoffset() is None:
+            raise ValueError('Window end must be timezone-aware')
+        end = end.astimezone(UTC)
         params = {'db': self.database, 'table': table}
         rows = self.query("SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} AND name IN ('EventTime', 'LogLevel') FORMAT JSON", params)
         cols = {r['name']: r['type'] for r in rows}
         if len(rows) != 2 or cols.get('LogLevel') != 'Int32' or not (cols.get('EventTime') == 'DateTime' or cols.get('EventTime', '').startswith('DateTime64(') or cols.get('EventTime', '').startswith('DateTime(')):
             raise ValueError('Unsupported logger schema')
         params.update(start=(end - dt.timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S.%f'), end=end.strftime('%Y-%m-%d %H:%M:%S.%f'))
-        sql = (f'SELECT count() AS n FROM {ident(self.database)}.{ident(table)} '
+        sql = (f'SELECT countIf(LogLevel = 4) AS error, countIf(LogLevel = 5) AS critical, count() AS total FROM {ident(self.database)}.{ident(table)} '
                "WHERE EventTime >= parseDateTime64BestEffort({start:String}, 6, 'UTC') "
                "AND EventTime < parseDateTime64BestEffort({end:String}, 6, 'UTC') "
                'AND LogLevel IN (4, 5) FORMAT JSON')
         result = self.query(sql, params)
-        if len(result) != 1 or not isinstance(result[0].get('n'), (str, int)) or not str(result[0]['n']).isdigit():
+        if len(result) != 1 or any(type(result[0].get(k)) not in (str, int) or not str(result[0][k]).isdigit() for k in ('error', 'critical', 'total')):
             raise ValueError('Invalid count')
-        return int(result[0]['n'])
+        counts = {k: int(result[0][k]) for k in ('error', 'critical', 'total')}
+        if counts['error'] + counts['critical'] != counts['total']:
+            raise ValueError('Inconsistent counts')
+        return counts
 
 
 class AlertCenter:
@@ -206,7 +212,21 @@ class Monitor:
             raise ValueError('Invalid incident state')
         return incident
 
-    def process(self, name, count, active, now):
+    def diagnostics(self, counts, now):
+        end = now.astimezone(UTC)
+        level = severity(counts['total'])
+        threshold = {'sev4': 3, 'sev3': 5, 'sev2': 15}.get(level)
+        context = {'WindowStartUtc': (end - dt.timedelta(minutes=15)).isoformat(),
+                   'WindowEndUtc': end.isoformat(), 'WindowBounds': '[start, end)',
+                   'ErrorCount': counts['error'], 'CriticalCount': counts['critical'],
+                   'TotalCount': counts['total'], 'TriggerThreshold': threshold,
+                   'ThresholdLevel': level, 'Thresholds': {'sev4': 3, 'sev3': 5, 'sev2': 15}}
+        text = (f"UTC window: [{context['WindowStartUtc']}, {context['WindowEndUtc']})\n"
+                f"Error: {counts['error']}; Critical: {counts['critical']}; Total: {counts['total']}\n"
+                f"Trigger threshold: {threshold} ({level}); rules: sev4 >=3, sev3 >=5, sev2 >=15; resolve at 0.")
+        return context, text
+
+    def process(self, name, counts, active, now):
         matches = [x for x in active if self.matches(x, name)]
         if len(matches) > 1:
             raise ValueError('Duplicate active incident identity')
@@ -225,14 +245,16 @@ class Monitor:
                 raise ValueError('Query/detail identity mismatch')
         else:
             current = None
-        if count is None:
+        if counts is None:
             return
+        count = counts['total']
+        context, diagnostic_text = self.diagnostics(counts, now)
         if current and current['Status'] == 'resolved':
             return
         if current is None and severity(count):
             payload = {'ReportId': str(uuid.uuid4()), 'Title': ('ClickHouse application errors: ' + name)[:200],
-                       'Content': 'Application error count reached the monitoring threshold.', 'Level': severity(count),
-                       'OccurredAtUtc': now.isoformat(), 'Metadata': self.identity(name)}
+                       'Content': diagnostic_text, 'Level': severity(count), 'Context': context,
+                       'OccurredAtUtc': now.astimezone(UTC).isoformat(), 'Metadata': self.identity(name)}
             self.store.save(name, payload)
             incident_id = self.api.create(payload)
             current = self.validate(self.api.get(incident_id), name)
@@ -251,7 +273,7 @@ class Monitor:
             action = 'resolve' if count == 0 else 'severity' if wanted and int(wanted[-1]) < int(current['Level'][-1]) else None
             if not action:
                 return
-            body = {'Version': current['Version'], 'Reason': 'ClickHouse application error count in the last 15 minutes: ' + str(count)}
+            body = {'Version': current['Version'], 'Reason': diagnostic_text}
             if action == 'severity':
                 body['Level'] = wanted
             try:

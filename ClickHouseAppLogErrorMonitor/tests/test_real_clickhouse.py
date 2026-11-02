@@ -22,6 +22,6 @@ class RealClickHouse(unittest.TestCase):
             execute(f'CREATE TABLE {quoted} (EventTime DateTime64(3, \'UTC\'), LogLevel Int32) ENGINE = Memory')
             self.assertIn(table, ch.tables())
             execute(f"INSERT INTO {quoted} VALUES ('2025-01-01 00:00:00',4), ('2025-01-01 00:00:01',5), ('2025-01-01 00:01:00',3), ('2025-01-01 00:15:00',4), ('2024-12-31 23:59:59',4)")
-            self.assertEqual(ch.count(table, dt.datetime(2025,1,1,0,15,tzinfo=main.UTC)), 2)
+            self.assertEqual(ch.count(table, dt.datetime(2025,1,1,0,15,tzinfo=main.UTC)), {'error': 1, 'critical': 1, 'total': 2})
         finally:
             execute(f'DROP DATABASE IF EXISTS {main.ident(database)} SYNC')

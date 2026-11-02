@@ -54,7 +54,7 @@ class Mock(BaseHTTPRequestHandler):
             elif 'system.columns' in sql:
                 rows = [{'name': 'EventTime', 'type': 'DateTime64(3)'}, {'name': 'LogLevel', 'type': 'Int32'}]
             else:
-                rows = [{'n': str(self.count)}]
+                rows = [{'error': str(self.count - self.count // 2), 'critical': str(self.count // 2), 'total': str(self.count)}]
             self.reply({'data': rows})
             return
         data = json.loads(body)
@@ -110,6 +110,40 @@ class Tests(unittest.TestCase):
 
     def test_thresholds(self):
         self.assertEqual([main.severity(n) for n in (0,1,2,3,4,5,14,15,16)], [None,None,None,'sev4','sev4','sev3','sev3','sev2','sev2'])
+
+    def test_diagnostic_payload_and_mutation_reasons(self):
+        for count, level, threshold in ((3, 'sev4', 3), (5, 'sev3', 5), (15, 'sev2', 15)):
+            self.scan(count)
+            posts = [json.loads(r[2]) for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents']
+            if count == 3:
+                payload = posts[0]
+                context = payload['Context']
+                self.assertEqual(context['WindowStartUtc'], '2024-12-31T23:45:00+00:00')
+                self.assertEqual(context['WindowEndUtc'], '2025-01-01T00:00:00+00:00')
+                self.assertEqual(context['WindowBounds'], '[start, end)')
+                self.assertEqual((context['ErrorCount'], context['CriticalCount'], context['TotalCount']), (2, 1, 3))
+                self.assertEqual((context['TriggerThreshold'], context['ThresholdLevel']), (threshold, level))
+                self.assertNotIn('Message', context)
+                self.assertNotIn('Exception', context)
+                text = payload['Content']
+            else:
+                text = json.loads(Mock.requests[-1][2])['Reason']
+            self.assertIn('UTC window: [', text)
+            self.assertIn(f'Total: {count}', text)
+            self.assertIn(f'Trigger threshold: {threshold} ({level})', text)
+        self.scan(0)
+        self.assertIn('Error: 0; Critical: 0; Total: 0', json.loads(Mock.requests[-1][2])['Reason'])
+
+    def test_invalid_diagnostic_counts_fail_closed(self):
+        for row in ({'error': '2', 'critical': '1', 'total': '4'},
+                    {'error': '-1', 'critical': '1', 'total': '0'},
+                    {'error': True, 'critical': 1, 'total': 2}, {'total': 0}):
+            original = self.ch.query
+            self.ch.query = lambda sql, params, row=row: [row] if 'countIf' in sql else original(sql, params)
+            try:
+                with self.assertRaises(ValueError): self.ch.count('app', dt.datetime.now(main.UTC))
+            finally:
+                self.ch.query = original
 
     def test_lifecycle(self):
         for n, expected in [(3,'sev4'),(5,'sev3'),(15,'sev2'),(2,'sev2'),(1,'sev2'),(0,'sev2')]:
