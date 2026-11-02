@@ -77,13 +77,14 @@ class ClickHouse:
         params = {'db': self.database, 'table': table}
         rows = self.query("SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {table:String} AND name IN ('EventTime', 'LogLevel') FORMAT JSON", params)
         cols = {r['name']: r['type'] for r in rows}
-        if len(rows) != 2 or cols.get('LogLevel') != 'Int32' or not (cols.get('EventTime') == 'DateTime' or cols.get('EventTime', '').startswith('DateTime64(') or cols.get('EventTime', '').startswith('DateTime(')):
+        if len(rows) != 2 or cols.get('LogLevel') not in ('Int32', 'String') or not (cols.get('EventTime') == 'DateTime' or cols.get('EventTime', '').startswith('DateTime64(') or cols.get('EventTime', '').startswith('DateTime(')):
             raise ValueError('Unsupported logger schema')
         params.update(start=(end - dt.timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S.%f'), end=end.strftime('%Y-%m-%d %H:%M:%S.%f'))
-        sql = (f'SELECT countIf(LogLevel = 4) AS error, countIf(LogLevel = 5) AS critical, count() AS total FROM {ident(self.database)}.{ident(table)} '
+        level = 'toInt32(LogLevel)' if cols['LogLevel'] == 'String' else 'LogLevel'
+        sql = (f'SELECT countIf({level} = 4) AS error, countIf({level} = 5) AS critical, count() AS total FROM {ident(self.database)}.{ident(table)} '
                "WHERE EventTime >= parseDateTime64BestEffort({start:String}, 6, 'UTC') "
                "AND EventTime < parseDateTime64BestEffort({end:String}, 6, 'UTC') "
-               'AND LogLevel IN (4, 5) FORMAT JSON')
+               f'AND {level} IN (4, 5) FORMAT JSON')
         result = self.query(sql, params)
         if len(result) != 1 or any(type(result[0].get(k)) not in (str, int) or not str(result[0][k]).isdigit() for k in ('error', 'critical', 'total')):
             raise ValueError('Invalid count')

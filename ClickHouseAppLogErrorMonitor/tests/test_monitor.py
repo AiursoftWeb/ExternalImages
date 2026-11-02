@@ -342,7 +342,7 @@ class Tests(unittest.TestCase):
         self.assertFalse(Mock.incidents)
 
     def test_schema_rejected_without_count(self):
-        self.ch.query = lambda sql, params: [{'name': 'EventTime', 'type': 'DateTime'}, {'name': 'LogLevel', 'type': 'String'}]
+        self.ch.query = lambda sql, params: [{'name': 'EventTime', 'type': 'DateTime'}, {'name': 'LogLevel', 'type': 'Float64'}]
         with self.assertRaises(ValueError): self.ch.count('bad', dt.datetime.now(main.UTC))
 
     def test_state_corruption_stops(self):
