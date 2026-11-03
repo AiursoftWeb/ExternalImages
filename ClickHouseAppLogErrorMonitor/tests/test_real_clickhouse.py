@@ -17,14 +17,23 @@ class RealClickHouse(unittest.TestCase):
             main.request(ch.url + '/', sql.encode(), ch.headers)
         try:
             execute(f'CREATE DATABASE {main.ident(database)}')
-            for level_type in ('Int32', 'String'):
-                with self.subTest(level_type=level_type):
-                    table = 'logs_' + level_type.lower()
+            for level_type, time_type in (('Int32', "DateTime('UTC')"), ('Int32', "DateTime64(3, 'UTC')"), ('String', "DateTime64(3, 'UTC')")):
+                with self.subTest(level_type=level_type, time_type=time_type):
+                    table = 'logs_' + level_type.lower() + ('_millis' if 'DateTime64' in time_type else '_seconds')
                     quoted = main.ident(database) + '.' + main.ident(table)
-                    execute(f'CREATE TABLE {quoted} (EventTime DateTime64(3, \'UTC\'), LogLevel {level_type}) ENGINE = Memory')
+                    execute(f'CREATE TABLE {quoted} (EventTime {time_type}, LogLevel {level_type}) ENGINE = Memory')
                     self.assertIn(table, ch.tables())
                     execute(f"INSERT INTO {quoted} VALUES ('2025-01-01 00:00:00',4), ('2025-01-01 00:00:01',5), ('2025-01-01 00:01:00',3), ('2025-01-01 00:15:00',4), ('2024-12-31 23:59:59',4)")
                     self.assertEqual(ch.count(table, dt.datetime(2025,1,1,0,15,tzinfo=main.UTC)), {'error': 1, 'critical': 1, 'total': 2})
+                    count_sql, _, _ = main.investigation_queries(database, table, dt.datetime(2025,1,1,0,15,tzinfo=main.UTC))
+                    result = ch.query(count_sql.rstrip(';') + ' FORMAT JSON')[0]
+                    self.assertEqual((int(result['errors']), int(result['critical']), int(result['total'])), (1, 1, 2))
+                    self.assertEqual(result['first_error'], '2025-01-01 00:00:00' + ('.000' if 'DateTime64' in time_type else ''))
+                    empty_sql, _, _ = main.investigation_queries(database, table, dt.datetime(2025,1,1,1,0,tzinfo=main.UTC))
+                    empty = ch.query(empty_sql.rstrip(';') + ' FORMAT JSON')[0]
+                    self.assertEqual(int(empty['total']), 0)
+                    self.assertIsNone(empty['first_error'])
+                    self.assertIsNone(empty['last_error'])
                     if level_type == 'String':
                         execute(f"INSERT INTO {quoted} VALUES ('2025-01-01 00:02:00','Error')")
                         with self.assertRaises(RuntimeError):

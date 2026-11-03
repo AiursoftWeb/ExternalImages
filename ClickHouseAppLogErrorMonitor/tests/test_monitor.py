@@ -62,7 +62,8 @@ class Mock(BaseHTTPRequestHandler):
         if parsed.path == '/api/v1/incidents':
             existing = next((x for x in self.incidents.values() if x['ReportId'] == data['ReportId']), None)
             if not existing:
-                existing = {'IncidentId': str(uuid.uuid4()), 'ReportId': data['ReportId'], 'Version': str(uuid.uuid4()), 'Status': 'new', 'Level': data['Level'], 'Metadata': data['Metadata']}
+                existing = {'IncidentId': str(uuid.uuid4()), 'ReportId': data['ReportId'], 'Version': str(uuid.uuid4()), 'Status': 'new', 'Level': data['Level'], 'Metadata': data['Metadata'],
+                            'Context': data.get('Context'), 'OccurredAtUtc': data.get('OccurredAtUtc')}
                 self.incidents[existing['IncidentId']] = existing
             if self.lost:
                 type(self).lost = False
@@ -139,6 +140,9 @@ class Tests(unittest.TestCase):
             self.assertIn('last 15 minutes', text)
             self.assertIn(f'{count} errors', text)
             self.assertIn('countIf(toInt32(LogLevel) = 4)', text)
+            self.assertIn('Error detection window', text)
+            self.assertIn('minOrNull(EventTime)', text)
+            self.assertIn('maxOrNull(EventTime)', text)
             self.assertIn("EventTime >= toDateTime64('2024-12-31 23:45:00.000000', 6, 'UTC')", text)
             self.assertIn("EventTime < toDateTime64('2025-01-01 00:00:00.000000', 6, 'UTC')", text)
             self.assertIn('AND toInt32(LogLevel) IN (4, 5)', text)
@@ -146,6 +150,51 @@ class Tests(unittest.TestCase):
             self.assertLessEqual(len(text.encode()), 4000)
         self.scan(0)
         self.assertIn('0 errors in the last 15 minutes (Error: 0; Critical: 0)', json.loads(Mock.requests[-1][2])['Reason'])
+
+    def test_resolution_separates_original_failure_and_recovery_queries_after_restart(self):
+        trigger = dt.datetime(2026, 11, 3, 1, 3, 48, 520503, tzinfo=main.UTC)
+        recovery = dt.datetime(2026, 11, 3, 1, 18, 48, 521823, tzinfo=main.UTC)
+        Mock.count = 15125
+        self.assertEqual(self.monitor.scan(trigger), 0)
+        creation = json.loads(next(r[2] for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents'))
+        self.store.close()
+        self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs')
+        self.monitor = main.Monitor(self.ch, self.api, self.store, 'node', 'AspNetCoreLogs')
+        Mock.count = 0
+        self.assertEqual(self.monitor.scan(recovery), 0)
+        reason = json.loads(Mock.requests[-1][2])['Reason']
+        original, recovered = reason.split('Verify recovery (expected total: 0; first_error and last_error: NULL):')
+        self.assertIn('Recovery confirmed. Zero errors are expected', original)
+        self.assertIn('this is not the original failure window', original)
+        self.assertIn('Original incident trigger window (creation snapshot, UTC)', original)
+        self.assertIn("EventTime >= toDateTime64('2026-11-03 00:48:48.520503'", original)
+        self.assertIn("EventTime < toDateTime64('2026-11-03 01:03:48.520503'", original)
+        self.assertIn('LIMIT 20;', original)
+        self.assertIn("EventTime >= toDateTime64('2026-11-03 01:03:48.521823'", recovered)
+        self.assertIn("EventTime < toDateTime64('2026-11-03 01:18:48.521823'", recovered)
+        self.assertNotIn('00:48:48.520503', recovered)
+        self.assertIn('minOrNull(EventTime)', recovered)
+        self.assertLessEqual(len(reason.encode()), 4000)
+        self.assertEqual(creation['Context']['WindowEndUtc'], trigger.isoformat())
+        self.assertEqual(next(iter(Mock.incidents.values()))['Context'], creation['Context'])
+
+    def test_legacy_recovery_uses_occurrence_or_reports_original_window_unavailable(self):
+        for context, occurred, known in (({'WindowEndUtc': '2024-12-31T21:00:00-02:00'}, '2024-12-31T22:00:00Z', True),
+                                        (None, '2024-12-31T23:00:00Z', True),
+                                        ({'WindowEndUtc': 'invalid'}, '2024-12-31T23:00:00+00:00', True),
+                                        ({'WindowEndUtc': '2024-12-31T23:00:00'}, None, False)):
+            with self.subTest(context=context):
+                self.scan(3)
+                incident = next(x for x in Mock.incidents.values() if x['Status'] != 'resolved')
+                incident['Context'], incident['OccurredAtUtc'] = context, occurred
+                self.scan(0)
+                reason = json.loads(Mock.requests[-1][2])['Reason']
+                if known:
+                    self.assertIn("EventTime >= toDateTime64('2024-12-31 22:45:00.000000'", reason)
+                    self.assertIn('Original incident trigger window', reason)
+                else:
+                    self.assertIn('Original trigger window unavailable', reason)
+                    self.assertNotIn('Investigate the original failure:\nSELECT', reason)
 
     def test_samples_are_redacted_and_bounded(self):
         self.ch.samples = lambda *_: [{'EventTime': '2024-12-31 23:59:59', 'LogLevel': 5,
