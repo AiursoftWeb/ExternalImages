@@ -1,12 +1,17 @@
 import argparse
 import datetime as dt
+import errno
+from email.utils import parsedate_to_datetime
 import fcntl
+import http.client
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.error
@@ -67,6 +72,45 @@ def redact_sample(value):
     return text.replace('`', "'")
 
 
+class TransientRequestFailure(RuntimeError):
+    def __init__(self, retry_after=None):
+        super().__init__('HTTP request temporarily unavailable')
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(value):
+    if not value:
+        return None
+    try:
+        if value.strip().isdigit():
+            return int(value.strip())
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is not None:
+            return max(0, (date - dt.datetime.now(UTC)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
+def transient_connection(error):
+    if isinstance(error, ssl.SSLError):
+        return False
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return isinstance(error, (ConnectionError, TimeoutError, http.client.IncompleteRead)) or (
+        isinstance(error, OSError) and error.errno in (
+            errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
+            errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPIPE))
+
+
+def wait_to_retry(error, attempt):
+    if error.retry_after is not None and error.retry_after > 30:
+        raise error from None
+    delay = max(2 ** attempt, error.retry_after or 0)
+    logging.warning('AlertCenter transient request failure; retrying attempt %s/3 in %s seconds', attempt + 2, delay)
+    time.sleep(delay)
+
+
 def request(url, data=None, headers=None):
     req = urllib.request.Request(url, data=data, headers={'User-Agent': 'Aiursoft-ClickHouseAppLogErrorMonitor/1.0', **(headers or {})})
     try:
@@ -75,11 +119,21 @@ def request(url, data=None, headers=None):
                 raise RuntimeError('HTTP failure')
             return response.read()
     except urllib.error.HTTPError as exc:
-        if exc.code == 409:
+        status = exc.code
+        retry_after = retry_after_seconds(exc.headers.get('Retry-After'))
+        exc.close()
+        if status == 409:
             raise Conflict() from None
+        if status not in (408, 429, 500, 502, 503, 504):
+            raise RuntimeError('HTTP request failed') from None
+        failure = TransientRequestFailure(retry_after)
+    except (urllib.error.URLError, OSError, http.client.IncompleteRead) as exc:
+        if not transient_connection(exc.reason if isinstance(exc, urllib.error.URLError) else exc):
+            raise RuntimeError('HTTP request failed') from None
+        failure = TransientRequestFailure()
+    except ValueError:
         raise RuntimeError('HTTP request failed') from None
-    except (OSError, ValueError):
-        raise RuntimeError('HTTP request failed') from None
+    raise failure from None
 
 
 class Conflict(Exception):
@@ -156,16 +210,27 @@ class AlertCenter:
         self.url = url.rstrip('/') + '/api/v1/incidents'
         self.headers = {'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}
 
-    def call(self, path='', payload=None, query=None):
+    def call(self, path='', payload=None, query=None, attempts=3):
         url = self.url + path + ('?' + urllib.parse.urlencode(query) if query else '')
         data = None if payload is None else json.dumps(payload, separators=(',', ':')).encode()
-        try:
-            result = json.loads(request(url, data, self.headers))
-            if not isinstance(result, dict) or type(result.get('Code')) is not int or result['Code'] not in (1, 2):
-                raise ValueError()
-            return result
-        except (ValueError, UnicodeError):
-            raise RuntimeError('Invalid AlertCenter response') from None
+        for attempt in range(attempts):
+            try:
+                result = json.loads(request(url, data, self.headers))
+                if not isinstance(result, dict) or type(result.get('Code')) is not int:
+                    raise ValueError()
+                if result['Code'] == -7:  # AiurProtocol Conflict
+                    raise Conflict()
+                if result['Code'] in (-6, -9, -11):  # RemoteNotAccessible, Timeout, TooManyRequests
+                    raise TransientRequestFailure()
+                if result['Code'] not in (1, 2):
+                    raise ValueError()
+                return result
+            except TransientRequestFailure as exc:
+                if attempt + 1 == attempts:
+                    raise
+                wait_to_retry(exc, attempt)
+            except (ValueError, UnicodeError):
+                raise RuntimeError('Invalid AlertCenter response') from None
 
     def active(self):
         items = []
@@ -197,7 +262,8 @@ class AlertCenter:
         return str(uuid.UUID(r['IncidentId']))
 
     def change(self, incident_id, action, payload):
-        self.call('/' + incident_id + '/' + action, payload)
+        # Monitor owns the three-write budget and re-reads ambiguous updates.
+        self.call('/' + incident_id + '/' + action, payload, attempts=1)
 
 
 class Store:
@@ -378,7 +444,8 @@ class Monitor:
         if not current:
             return
         incident_id, report_id = current['IncidentId'], current['ReportId']
-        for attempt in range(3):
+        attempt = 0
+        while True:
             if current['IncidentId'].lower() != incident_id.lower() or current['ReportId'].lower() != report_id.lower():
                 raise ValueError('Incident changed identity')
             if current['Status'] == 'resolved':
@@ -387,17 +454,25 @@ class Monitor:
             action = 'resolve' if count == 0 else 'severity' if wanted and int(wanted[-1]) < int(current['Level'][-1]) else None
             if not action:
                 return
+            if attempt == 3:
+                raise RuntimeError('Repeated incident update failures')
+            attempt += 1
             body = {'Version': current['Version'], 'Reason': diagnostic_text}
             if action == 'severity':
                 body['Level'] = wanted
             try:
                 self.api.change(current['IncidentId'], action, body)
                 return
-            except (Conflict, RuntimeError):
+            except TransientRequestFailure as exc:
+                if exc.retry_after is not None and exc.retry_after > 30:
+                    raise
+                if attempt < 3:
+                    wait_to_retry(exc, attempt - 1)
+                current = self.validate(self.api.get(current['IncidentId']), name)
+            except Conflict:
                 # A conflict may be represented as a protocol error rather than HTTP 409.
                 # A lost response is ambiguous too: always re-read before retrying.
                 current = self.validate(self.api.get(current['IncidentId']), name)
-        raise RuntimeError('Repeated incident update failures')
 
     def scan(self, now=None):
         start = time.monotonic()
