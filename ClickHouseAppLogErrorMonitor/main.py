@@ -35,10 +35,26 @@ def investigation_queries(database, table, end):
              '  AND toInt32(LogLevel) IN (4, 5)')
     count = ('SELECT countIf(toInt32(LogLevel) = 4) AS errors,\n'
              '       countIf(toInt32(LogLevel) = 5) AS critical, count() AS total,\n'
-             '       min(EventTime) AS first_error, max(EventTime) AS last_error\n'
+             '       minOrNull(EventTime) AS first_error, maxOrNull(EventTime) AS last_error\n'
              f'FROM {source}\nWHERE {where};')
     details = f'SELECT *\nFROM {source}\nWHERE {where}\nORDER BY EventTime DESC\nLIMIT 20;'
     return count, details, where
+
+
+def original_window_end(incident):
+    context = incident.get('Context')
+    candidates = [context.get('WindowEndUtc') if isinstance(context, dict) else None,
+                  incident.get('OccurredAtUtc')]
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        try:
+            end = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if end.tzinfo is not None and end.utcoffset() is not None:
+                return end.astimezone(UTC)
+        except ValueError:
+            pass
+    return None
 
 
 def redact_sample(value):
@@ -266,7 +282,7 @@ class Monitor:
             raise ValueError('Invalid incident state')
         return incident
 
-    def diagnostics(self, name, counts, now, examples=False):
+    def diagnostics(self, name, counts, now, examples=False, trigger_end=None):
         end = now.astimezone(UTC)
         level = severity(counts['total'])
         threshold = {'sev4': 3, 'sev3': 5, 'sev2': 15}.get(level)
@@ -276,16 +292,32 @@ class Monitor:
                    'TotalCount': counts['total'], 'TriggerThreshold': threshold,
                    'ThresholdLevel': level, 'Thresholds': {'sev4': 3, 'sev3': 5, 'sev2': 15}}
         count_sql, detail_sql, _ = investigation_queries(self.database, name, end)
+        recovering = counts['total'] == 0
+        window_label = 'Recovery verification window' if recovering else 'Error detection window'
         text = (f"{self.node} / {self.database}.{name}\n\n"
                 f"{counts['total']} errors in the last 15 minutes "
                 f"(Error: {counts['error']}; Critical: {counts['critical']}). Warnings excluded.\n"
-                f"Window (UTC, start inclusive / end exclusive): "
+                f"{window_label} (UTC, start inclusive / end exclusive): "
                 f"{end - dt.timedelta(minutes=15):%Y-%m-%d %H:%M:%S} to {end:%Y-%m-%d %H:%M:%S}.\n"
                 "Checked every 5 minutes; automatically closes when the 15-minute count is zero.\n\n")
         if self.public_url:
             text += f'ClickHouse query page: {self.public_url}/play\n\n'
-        text += (f'Verify the count and first/last error times:\n{count_sql}\n\n'
-                 f'Inspect messages and exception stacks (up to 20 rows):\n{detail_sql}')
+        if recovering:
+            text += ('Recovery confirmed. Zero errors are expected in the recovery window; '
+                     'this is not the original failure window.\n\n')
+            if trigger_end is not None:
+                original_count, original_details, _ = investigation_queries(self.database, name, trigger_end)
+                text += (f'Original incident trigger window (creation snapshot, UTC): '
+                         f'{trigger_end - dt.timedelta(minutes=15):%Y-%m-%d %H:%M:%S} to {trigger_end:%Y-%m-%d %H:%M:%S}.\n'
+                         f'Investigate the original failure:\n{original_count}\n\n'
+                         f'Inspect original messages and exception stacks (up to 20 rows):\n{original_details}\n\n')
+            else:
+                text += ('Original trigger window unavailable. Open the incident creation details; '
+                         'do not use the recovery query to investigate the original failure.\n\n')
+            text += (f'Verify recovery (expected total: 0; first_error and last_error: NULL):\n{count_sql}')
+        else:
+            text += (f'Investigate this error detection window:\n{count_sql}\n\n'
+                     f'Inspect messages and exception stacks (up to 20 rows):\n{detail_sql}')
         if examples and counts['total']:
             try:
                 rows = self.ch.samples(name, now)
@@ -331,7 +363,8 @@ class Monitor:
             current = None
         wanted = severity(count)
         examples = bool(wanted and (not current or int(wanted[-1]) < int(current['Level'][-1])))
-        context, diagnostic_text = self.diagnostics(name, counts, now, examples)
+        trigger_end = original_window_end(current) if current and count == 0 else None
+        context, diagnostic_text = self.diagnostics(name, counts, now, examples, trigger_end)
         if current is None and severity(count):
             payload = {'ReportId': str(uuid.uuid4()), 'Title': (f'[{self.node}] {name}: {count} errors in 15 minutes')[:200],
                        'Content': diagnostic_text, 'Level': severity(count), 'Context': context,
