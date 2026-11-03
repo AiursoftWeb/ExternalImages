@@ -8,6 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Aiursoft.AlertCenter.SDK" Version="10.7.0" />
+    <PackageReference Include="Aiursoft.AlertCenter.SDK" Version="10.10.2" />
   </ItemGroup>
 </Project>

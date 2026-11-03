@@ -19,7 +19,11 @@ class Mock(BaseHTTPRequestHandler):
     count = 3
     tables = ['app']
     requests = []
-    lost = False
+    lost = 0
+    failures = {}
+    protocol_failures = {}
+    retry_after = None
+    lost_update = False
 
     def log_message(self, *args):
         pass
@@ -28,12 +32,27 @@ class Mock(BaseHTTPRequestHandler):
         body = json.dumps(value).encode()
         self.send_response(status)
         self.send_header('Content-Length', str(len(body)))
+        if status >= 400 and self.retry_after is not None:
+            self.send_header('Retry-After', self.retry_after)
         self.end_headers()
         self.wfile.write(body)
+
+    def fail_request(self, method, path):
+        failures = self.failures.get((method, path), [])
+        if failures:
+            self.reply({'Code': 3}, failures.pop(0))
+            return True
+        failures = self.protocol_failures.get((method, path), [])
+        if failures:
+            self.reply({'Code': failures.pop(0)})
+            return True
+        return False
 
     def do_GET(self):
         self.requests.append(('GET', self.path))
         parsed = urlparse(self.path)
+        if self.fail_request('GET', parsed.path):
+            return
         if parsed.path == '/api/v1/incidents':
             q = parse_qs(parsed.query)
             rows = [x for x in self.incidents.values() if x['Status'] != 'resolved' and x['Metadata']['source'] == q['MetadataValue'][0]]
@@ -46,6 +65,8 @@ class Mock(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers['Content-Length']))
         self.requests.append(('POST', self.path, body.decode()))
         parsed = urlparse(self.path)
+        if self.fail_request('POST', parsed.path):
+            return
         if not parsed.path.startswith('/api/'):
             sql = body.decode()
             if 'system.databases' in sql:
@@ -66,7 +87,7 @@ class Mock(BaseHTTPRequestHandler):
                             'Context': data.get('Context'), 'OccurredAtUtc': data.get('OccurredAtUtc')}
                 self.incidents[existing['IncidentId']] = existing
             if self.lost:
-                type(self).lost = False
+                type(self).lost -= 1
                 self.connection.shutdown(2)
                 self.connection.close()
                 return
@@ -81,6 +102,10 @@ class Mock(BaseHTTPRequestHandler):
             elif action == 'severity': x['Level'] = data['Level']
             else: raise AssertionError(action)
             x['Version'] = str(uuid.uuid4())
+            if self.lost_update:
+                self.connection.shutdown(2)
+                self.connection.close()
+                return
             self.reply({'Code': 2})
 
 
@@ -96,7 +121,10 @@ class Tests(unittest.TestCase):
         cls.server.shutdown(); cls.server.server_close(); cls.thread.join()
 
     def setUp(self):
-        Mock.incidents = {}; Mock.requests = []; Mock.count = 3; Mock.tables = ['app']; Mock.lost = False
+        Mock.incidents = {}; Mock.requests = []; Mock.count = 3; Mock.tables = ['app']; Mock.lost = 0
+        Mock.failures = {}; Mock.protocol_failures = {}; Mock.retry_after = None; Mock.lost_update = False
+        sleeper = patch.object(main.time, 'sleep')
+        self.retry_sleep = sleeper.start(); self.addCleanup(sleeper.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs')
         self.ch = main.ClickHouse(self.url, 'AspNetCoreLogs', 'default', '')
@@ -255,7 +283,7 @@ class Tests(unittest.TestCase):
         self.assertFalse(any('/mitigate' in r[1] for r in Mock.requests))
 
     def test_lost_create_restart_and_zero(self):
-        Mock.lost = True
+        Mock.lost = 3
         self.assertEqual(self.monitor.scan(), 1)
         payload = self.store.pending('app'); self.assertIsNotNone(payload)
         self.store.close(); self.store = main.Store(self.tmp.name, 'node', 'AspNetCoreLogs'); self.monitor.store = self.store
@@ -265,6 +293,195 @@ class Tests(unittest.TestCase):
         self.assertEqual(next(iter(Mock.incidents.values()))['Status'], 'resolved')
         creates = [json.loads(x[2]) for x in Mock.requests if x[0] == 'POST' and x[1] == '/api/v1/incidents']
         self.assertEqual(creates[0], creates[1])
+
+    def test_transient_query_and_create_recover_on_third_attempt(self):
+        for method in ('GET', 'POST'):
+            for status in (408, 429, 500, 502, 503, 504):
+                with self.subTest(method=method, status=status):
+                    Mock.requests = []; Mock.incidents = {}
+                    Mock.failures = {(method, '/api/v1/incidents'): [status, status]}
+                    self.retry_sleep.reset_mock()
+                    with self.assertLogs(level='WARNING') as logs:
+                        self.scan(3)
+                    requests = [r for r in Mock.requests if r[0] == method and urlparse(r[1]).path == '/api/v1/incidents']
+                    self.assertEqual(len(requests), 3)
+                    self.assertEqual([c.args[0] for c in self.retry_sleep.call_args_list], [1, 2])
+                    self.assertEqual(len(logs.output), 2)
+                    self.assertTrue(all('WARNING' in line and 'secret' not in line for line in logs.output))
+                    self.assertEqual(len(Mock.incidents), 1)
+                    if method == 'POST':
+                        self.assertEqual(len({r[2] for r in requests}), 1)
+
+    def test_lost_create_response_recovers_without_duplicate_or_pending(self):
+        Mock.lost = 2
+        self.scan(3)
+        creates = [r for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents']
+        self.assertEqual(len(creates), 3)
+        self.assertEqual(len({r[2] for r in creates}), 1)
+        self.assertEqual(len(Mock.incidents), 1)
+        self.assertIsNone(self.store.pending('app'))
+
+    def test_exhausted_create_preserves_report_for_next_scan(self):
+        Mock.failures = {('POST', '/api/v1/incidents'): [503] * 3}
+        self.assertEqual(self.monitor.scan(), 1)
+        payload = self.store.pending('app')
+        self.assertIsNotNone(payload)
+        creates = [r for r in Mock.requests if r[0] == 'POST' and r[1] == '/api/v1/incidents']
+        self.assertEqual(len(creates), 3)
+        self.scan(3)
+        self.assertEqual(next(iter(Mock.incidents.values()))['ReportId'], payload['ReportId'])
+        self.assertEqual(len(Mock.incidents), 1)
+
+    def test_permanent_http_errors_and_conflicts_fail_fast(self):
+        for status in (400, 401, 403, 404, 409, 422, 501):
+            for method in ('GET', 'POST'):
+                with self.subTest(status=status, method=method):
+                    Mock.requests = []; self.retry_sleep.reset_mock()
+                    Mock.failures = {(method, '/api/v1/incidents'): [status] * 3}
+                    with self.assertRaises((RuntimeError, main.Conflict)):
+                        self.api.call(payload={} if method == 'POST' else None)
+                    self.assertEqual(len(Mock.requests), 1)
+                    self.retry_sleep.assert_not_called()
+
+    def test_retry_after_is_honored_or_deferred_without_early_retry(self):
+        for delay, attempts in (('4', 2), ('31', 1)):
+            with self.subTest(delay=delay):
+                Mock.requests = []; self.retry_sleep.reset_mock()
+                Mock.failures = {('GET', '/api/v1/incidents'): [429]}
+                Mock.retry_after = delay
+                if attempts == 1:
+                    with self.assertRaises(main.TransientRequestFailure):
+                        self.api.active()
+                    self.retry_sleep.assert_not_called()
+                else:
+                    self.api.active()
+                    self.retry_sleep.assert_called_once_with(4)
+                self.assertEqual(len(Mock.requests), attempts)
+
+    def test_connection_failures_retry_but_configuration_and_shutdown_fail_fast(self):
+        original = main.urllib.request.urlopen
+        for failure in (TimeoutError(), ConnectionResetError(),
+                        main.urllib.error.URLError(TimeoutError()),
+                        main.urllib.error.URLError(main.socket.gaierror(main.socket.EAI_AGAIN, 'temporary')),
+                        main.http.client.IncompleteRead(b'', 10)):
+            with self.subTest(failure=type(failure).__name__):
+                self.retry_sleep.reset_mock()
+                attempts = []
+                def flaky(*args, **kwargs):
+                    attempts.append(1)
+                    if len(attempts) < 3:
+                        raise failure
+                    return original(*args, **kwargs)
+                with patch.object(main.urllib.request, 'urlopen', side_effect=flaky):
+                    self.assertEqual(self.api.active(), [])
+                self.assertEqual(len(attempts), 3)
+                self.assertEqual(self.retry_sleep.call_count, 2)
+        for failure in (main.ssl.SSLCertVerificationError('invalid certificate'),
+                        main.urllib.error.URLError(main.ssl.SSLCertVerificationError('invalid certificate')),
+                        main.socket.gaierror(main.socket.EAI_NONAME, 'invalid host'), ValueError('invalid URL'),
+                        KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                self.retry_sleep.reset_mock()
+                with patch.object(main.urllib.request, 'urlopen', side_effect=failure) as send:
+                    with self.assertRaises((RuntimeError, KeyboardInterrupt)):
+                        self.api.active()
+                self.assertEqual(send.call_count, 1)
+                self.retry_sleep.assert_not_called()
+
+    def test_protocol_transient_codes_retry_but_business_rejections_fail_fast(self):
+        for code in (-6, -9, -11):
+            with self.subTest(code=code):
+                Mock.requests = []
+                Mock.protocol_failures = {('GET', '/api/v1/incidents'): [code, code]}
+                self.assertEqual(self.api.active(), [])
+                self.assertEqual(len(Mock.requests), 3)
+        for code in (-1, -4, -5, -7, -8, -10):
+            with self.subTest(code=code):
+                Mock.requests = []; self.retry_sleep.reset_mock()
+                Mock.protocol_failures = {('GET', '/api/v1/incidents'): [code] * 3}
+                with self.assertRaises((RuntimeError, main.Conflict)):
+                    self.api.active()
+                self.assertEqual(len(Mock.requests), 1)
+                self.retry_sleep.assert_not_called()
+
+    def test_protocol_conflict_reloads_before_next_versioned_write(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        path = '/api/v1/incidents/' + incident['IncidentId'] + '/severity'
+        Mock.protocol_failures = {('POST', path): [-7]}
+        self.scan(5)
+        writes = [i for i, r in enumerate(Mock.requests) if r[0] == 'POST' and r[1] == path]
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(any(r[0] == 'GET' and r[1].endswith(incident['IncidentId']) for r in Mock.requests[writes[0]+1:writes[1]]))
+
+    def test_retry_after_http_date_and_invalid_value(self):
+        from email.utils import format_datetime
+        for header in (format_datetime(dt.datetime.now(main.UTC) + dt.timedelta(seconds=10)), 'invalid'):
+            with self.subTest(header=header):
+                Mock.failures = {('GET', '/api/v1/incidents'): [429]}
+                Mock.retry_after = header
+                self.retry_sleep.reset_mock()
+                self.assertEqual(self.api.active(), [])
+                self.retry_sleep.assert_called_once()
+                delay = self.retry_sleep.call_args.args[0]
+                if header == 'invalid':
+                    self.assertEqual(delay, 1)
+                else:
+                    self.assertGreater(delay, 8)
+                    self.assertLessEqual(delay, 10)
+
+    def test_versioned_updates_have_three_write_budget_and_reconcile_lost_response(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        path = '/api/v1/incidents/' + incident['IncidentId'] + '/severity'
+        Mock.failures = {('POST', path): [503] * 3}
+        self.assertEqual(self.monitor.scan(), 0)
+        Mock.count = 5
+        self.assertEqual(self.monitor.scan(), 1)
+        writes = [r for r in Mock.requests if r[0] == 'POST' and r[1] == path]
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(len({json.loads(r[2])['Version'] for r in writes}), 1)
+        Mock.lost_update = True
+        self.scan(5)
+        self.assertEqual(incident['Level'], 'sev3')
+        self.assertEqual(len([r for r in Mock.requests if r[0] == 'POST' and r[1] == path]), 4)
+        Mock.count = 0
+        self.assertEqual(self.monitor.scan(), 0)
+        self.assertEqual(incident['Status'], 'resolved')
+
+    def test_versioned_update_authentication_failure_is_not_replayed(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        path = '/api/v1/incidents/' + incident['IncidentId'] + '/severity'
+        Mock.failures = {('POST', path): [401] * 3}
+        Mock.count = 5
+        self.retry_sleep.reset_mock()
+        self.assertEqual(self.monitor.scan(), 1)
+        self.assertEqual(len([r for r in Mock.requests if r[0] == 'POST' and r[1] == path]), 1)
+        self.retry_sleep.assert_not_called()
+        self.assertEqual(incident['Level'], 'sev4')
+
+    def test_third_update_lost_receipt_is_reconciled_without_fourth_write(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        path = '/api/v1/incidents/' + incident['IncidentId'] + '/severity'
+        Mock.failures = {('POST', path): [503, 503]}
+        Mock.lost_update = True
+        self.scan(5)
+        self.assertEqual(incident['Level'], 'sev3')
+        self.assertEqual(len([r for r in Mock.requests if r[0] == 'POST' and r[1] == path]), 3)
+
+    def test_update_long_retry_after_is_deferred_without_replay(self):
+        self.scan(3)
+        incident = next(iter(Mock.incidents.values()))
+        path = '/api/v1/incidents/' + incident['IncidentId'] + '/severity'
+        Mock.failures = {('POST', path): [429]}
+        Mock.retry_after = '31'
+        self.retry_sleep.reset_mock()
+        Mock.count = 5
+        self.assertEqual(self.monitor.scan(), 1)
+        self.assertEqual(len([r for r in Mock.requests if r[0] == 'POST' and r[1] == path]), 1)
+        self.retry_sleep.assert_not_called()
 
     def test_query_and_special_identifier(self):
         Mock.tables = ['a`b\\c']; self.scan(3)
@@ -285,7 +502,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(x['Status'], 'resolved')
 
     def test_pending_resolved_receipt_creates_recurrence_immediately(self):
-        Mock.lost = True
+        Mock.lost = 3
         self.assertEqual(self.monitor.scan(), 1)
         old = next(iter(Mock.incidents.values()))
         old['Status'] = 'resolved'
@@ -306,7 +523,7 @@ class Tests(unittest.TestCase):
     def test_pending_resolved_receipt_respects_creation_threshold(self):
         for count, level in ((0, None), (1, None), (2, None), (3, 'sev4'), (5, 'sev3')):
             with self.subTest(count=count):
-                Mock.incidents = {}; Mock.requests = []; Mock.count = 3; Mock.lost = True
+                Mock.incidents = {}; Mock.requests = []; Mock.count = 3; Mock.lost = 3
                 self.assertEqual(self.monitor.scan(), 1)
                 old = next(iter(Mock.incidents.values()))
                 old['Status'] = 'resolved'
@@ -320,7 +537,7 @@ class Tests(unittest.TestCase):
                 self.assertIsNone(self.store.pending('app'))
 
     def test_pending_recovers_when_table_disappears(self):
-        Mock.lost = True
+        Mock.lost = 3
         self.assertEqual(self.monitor.scan(), 1)
         Mock.tables = []
         self.assertEqual(self.monitor.scan(), 1)
@@ -463,7 +680,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(calls, ['severity', 'severity'])
         def lost(incident_id, action, payload):
             original(incident_id, action, payload)
-            raise RuntimeError('lost')
+            raise main.TransientRequestFailure()
         self.api.change = lost
         self.scan(0)
         self.assertEqual(next(iter(Mock.incidents.values()))['Status'], 'resolved')
