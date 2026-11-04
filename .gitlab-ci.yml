@@ -135,3 +135,14 @@ deploy_http_error_alert_center_bridge:
       changes:
         - .gitlab-ci.yml
         - HttpErrorAlertCenterBridge/**/*
+
+deploy_shepherd_140fixed:
+  extends: .deploy_template
+  variables:
+    IMAGE_NAME: "shepherd-140fixed"
+    CONTEXT: "./Shepherd140Fixed"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - .gitlab-ci.yml
+        - Shepherd140Fixed/**/*
