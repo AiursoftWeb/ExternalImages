@@ -339,12 +339,18 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
     private static IEnumerable<AbuseFinding> Largest(IReadOnlyList<AbuseFinding> findings) => findings
         .OrderByDescending(x => x.Sample.Window(WindowMinutes(x)).Bytes).ThenBy(x => x.Sample.Prefix, StringComparer.Ordinal);
 
+    private static string[] TargetSites(IReadOnlyList<AbuseFinding> findings, IReadOnlyList<AbuseImpact> impacts) => findings
+        .SelectMany(x => x.Paths?.Top ?? []).OrderByDescending(x => x.Bytes).Select(x => x.Host)
+        .Concat(impacts.Where(x => x.Confirmed).Select(x => x.Host)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
     private string Title(IReadOnlyList<AbuseFinding> findings, IReadOnlyList<AbuseImpact> impacts)
     {
         var primary = Largest(findings).FirstOrDefault();
-        var text = impacts.Any(x => x.Confirmed) ? $"HTTP activity with business impact on {settings.Server}" :
-            primary?.Reason == "high request volume" ? $"Suspected request flood on {settings.Server}" :
-            $"Suspected repeated downloads on {settings.Server}";
+        var sites = TargetSites(findings, impacts);
+        var target = sites.Length > 0 ? $"{Display(sites[0], 60)}{(sites.Length > 1 ? $" (+{sites.Length - 1} sites)" : "")}: " : "";
+        var behavior = impacts.Any(x => x.Confirmed) ? "HTTP activity with business impact" :
+            primary?.Reason == "high request volume" ? "Suspected request flood" : "Suspected repeated downloads";
+        var text = $"[{Display(settings.Server, 40)}] {target}{behavior}";
         if (primary != null)
         {
             var window = primary.Sample.Window(WindowMinutes(primary));
@@ -361,6 +367,15 @@ internal sealed class AbuseReporter(AlertCenterApiClient api, Settings settings,
     {
         var confirmed = impacts.Where(x => x.Confirmed).ToArray();
         var text = new StringBuilder();
+        text.AppendLine($"SERVER: {Display(settings.Server, 120)}");
+        var sites = TargetSites(findings, impacts);
+        text.AppendLine(sites.Length > 0
+            ? $"TARGET SITES (observed): {string.Join(", ", sites.Take(5).Select(x => Display(x, 80)))}{(sites.Length > 5 ? $" (+{sites.Length - 5} more)" : "")}"
+            : "TARGET SITES: Not collected in this scan; inspect tracked sources in Traffic V2 and incident metadata.");
+        foreach (var path in findings.SelectMany(x => x.Paths?.Top ?? []).OrderByDescending(x => x.Bytes)
+                     .Select(x => $"{Display(x.Host, 80)}{Display(x.Path.Split('?')[0], 100)}").Distinct(StringComparer.Ordinal).Take(3))
+            text.AppendLine($"TARGET PATH: {path}");
+        text.AppendLine();
         text.AppendLine(confirmed.Length > 0
             ? $"HTTP activity on {settings.Server} coincides with service errors or slower responses for other visitors (sev2)."
             : $"Suspected abnormal HTTP activity on {settings.Server} (sev3). Business impact has not been confirmed.");
