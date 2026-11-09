@@ -176,4 +176,5 @@ s360_npm:
   rules:
     - changes:
         - .gitlab-ci.yml
+        - ninja.yaml
         - AsrApi/**/*
