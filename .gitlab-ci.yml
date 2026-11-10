@@ -102,16 +102,14 @@ deploy_gitlab_pipeline_alert_center_bridge:
   extends: .deploy_template
   variables:
     IMAGE_NAME: "gitlab_pipeline_alert_center_bridge"
-    CONTEXT: "."
-    BUILD_ARGS: "--file ./GitLabPipelineAlertCenterBridge/Dockerfile"
+    CONTEXT: "./GitLabPipelineAlertCenterBridge"
+    BUILD_ARGS: "--build-arg NUGET_LOCKED_MODE=true"
   dependencies:
     - s360_nuget
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
         - .gitlab-ci.yml
-        - ExternalImages.sln
-        - nuget.config
         - GitLabPipelineAlertCenterBridge/**/*
 
 deploy_cloudflare_analytics_collector:
@@ -150,16 +148,14 @@ deploy_http_error_alert_center_bridge:
   extends: .deploy_template
   variables:
     IMAGE_NAME: "http_error_alert_center_bridge"
-    CONTEXT: "."
-    BUILD_ARGS: "--file ./HttpErrorAlertCenterBridge/Dockerfile"
+    CONTEXT: "./HttpErrorAlertCenterBridge"
+    BUILD_ARGS: "--build-arg NUGET_LOCKED_MODE=true"
   dependencies:
     - s360_nuget
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
         - .gitlab-ci.yml
-        - ExternalImages.sln
-        - nuget.config
         - HttpErrorAlertCenterBridge/**/*
 
 deploy_shepherd_140fixed:
@@ -195,8 +191,12 @@ s360_nuget:
     - export PATH="$PATH:$HOME/.dotnet/tools"
     - dotnet tool update Aiursoft.S360.Client --global --add-source https://nuget.aiursoft.com/v3/index.json
   script:
-    - dotnet restore ExternalImages.sln --use-lock-file --disable-parallel --no-cache --configfile nuget.config --packages "$CI_PROJECT_DIR/obj/s360-packages"
-    - s360 check --path ExternalImages.sln --ecosystem nuget --purpose "$S360_PURPOSE"
+    - |
+      set -eu
+      for bridge in GitLabPipelineAlertCenterBridge HttpErrorAlertCenterBridge; do
+        dotnet restore "$bridge/Bridge.sln" --use-lock-file --disable-parallel --no-cache --configfile "$bridge/nuget.config" --packages "$CI_PROJECT_DIR/obj/s360-packages"
+        s360 check --path "$bridge/Bridge.sln" --ecosystem nuget --purpose "$S360_PURPOSE"
+      done
   artifacts:
     expire_in: 1 day
     paths:
@@ -208,8 +208,6 @@ s360_nuget:
   rules: &dotnet_bridge_rules
     - changes:
         - .gitlab-ci.yml
-        - ExternalImages.sln
-        - nuget.config
         - GitLabPipelineAlertCenterBridge/**/*
         - HttpErrorAlertCenterBridge/**/*
 
@@ -218,8 +216,12 @@ test_dotnet_bridges:
   dependencies:
     - s360_nuget
   script:
-    - dotnet restore ExternalImages.sln --locked-mode --disable-parallel --no-cache --configfile nuget.config --packages "$CI_PROJECT_DIR/obj/s360-packages"
-    - dotnet build ExternalImages.sln --configuration Release --no-restore --maxcpucount:1
+    - |
+      set -eu
+      for bridge in GitLabPipelineAlertCenterBridge HttpErrorAlertCenterBridge; do
+        dotnet restore "$bridge/Bridge.sln" --locked-mode --disable-parallel --no-cache --configfile "$bridge/nuget.config" --packages "$CI_PROJECT_DIR/obj/s360-packages"
+        dotnet build "$bridge/Bridge.sln" --configuration Release --no-restore --maxcpucount:1
+      done
   retry:
     max: 2
     when: runner_system_failure

@@ -1,9 +1,10 @@
 FROM --platform=$BUILDPLATFORM hub.aiursoft.com/aiursoft/internalimages/dotnet AS build
 WORKDIR /src
-COPY nuget.config ./
-COPY HttpErrorAlertCenterBridge/*.csproj HttpErrorAlertCenterBridge/packages.lock.json ./
-RUN dotnet restore --locked-mode --configfile nuget.config
-COPY HttpErrorAlertCenterBridge/*.cs ./
+ARG NUGET_LOCKED_MODE=false
+COPY *.csproj nuget.config packages.lock.json* ./
+RUN if [ "$NUGET_LOCKED_MODE" = true ]; then test -f packages.lock.json; fi \
+    && dotnet restore --use-lock-file --configfile nuget.config -p:RestoreLockedMode="$NUGET_LOCKED_MODE"
+COPY *.cs ./
 RUN dotnet publish -c Release --no-restore -o /app /p:UseAppHost=false
 
 FROM hub.aiursoft.com/aiursoft/internalimages/dotnetonlyruntime
