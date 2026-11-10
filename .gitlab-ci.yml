@@ -102,11 +102,16 @@ deploy_gitlab_pipeline_alert_center_bridge:
   extends: .deploy_template
   variables:
     IMAGE_NAME: "gitlab_pipeline_alert_center_bridge"
-    CONTEXT: "./GitLabPipelineAlertCenterBridge"
+    CONTEXT: "."
+    BUILD_ARGS: "--file ./GitLabPipelineAlertCenterBridge/Dockerfile"
+  dependencies:
+    - s360_nuget
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
         - .gitlab-ci.yml
+        - ExternalImages.sln
+        - nuget.config
         - GitLabPipelineAlertCenterBridge/**/*
 
 deploy_cloudflare_analytics_collector:
@@ -145,11 +150,16 @@ deploy_http_error_alert_center_bridge:
   extends: .deploy_template
   variables:
     IMAGE_NAME: "http_error_alert_center_bridge"
-    CONTEXT: "./HttpErrorAlertCenterBridge"
+    CONTEXT: "."
+    BUILD_ARGS: "--file ./HttpErrorAlertCenterBridge/Dockerfile"
+  dependencies:
+    - s360_nuget
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
         - .gitlab-ci.yml
+        - ExternalImages.sln
+        - nuget.config
         - HttpErrorAlertCenterBridge/**/*
 
 deploy_shepherd_140fixed:
@@ -178,3 +188,39 @@ s360_npm:
         - .gitlab-ci.yml
         - ninja.yaml
         - AsrApi/**/*
+
+s360_nuget:
+  stage: s360
+  before_script:
+    - export PATH="$PATH:$HOME/.dotnet/tools"
+    - dotnet tool update Aiursoft.S360.Client --global --add-source https://nuget.aiursoft.com/v3/index.json
+  script:
+    - dotnet restore ExternalImages.sln --use-lock-file --disable-parallel --no-cache --configfile nuget.config --packages "$CI_PROJECT_DIR/obj/s360-packages"
+    - s360 check --path ExternalImages.sln --ecosystem nuget --purpose "$S360_PURPOSE"
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - GitLabPipelineAlertCenterBridge/packages.lock.json
+      - HttpErrorAlertCenterBridge/packages.lock.json
+  retry:
+    max: 2
+    when: runner_system_failure
+  rules: &dotnet_bridge_rules
+    - changes:
+        - .gitlab-ci.yml
+        - ExternalImages.sln
+        - nuget.config
+        - GitLabPipelineAlertCenterBridge/**/*
+        - HttpErrorAlertCenterBridge/**/*
+
+test_dotnet_bridges:
+  stage: test
+  dependencies:
+    - s360_nuget
+  script:
+    - dotnet restore ExternalImages.sln --locked-mode --disable-parallel --no-cache --configfile nuget.config --packages "$CI_PROJECT_DIR/obj/s360-packages"
+    - dotnet build ExternalImages.sln --configuration Release --no-restore --maxcpucount:1
+  retry:
+    max: 2
+    when: runner_system_failure
+  rules: *dotnet_bridge_rules

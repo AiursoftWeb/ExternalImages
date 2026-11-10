@@ -1,8 +1,9 @@
 FROM --platform=$BUILDPLATFORM hub.aiursoft.com/aiursoft/internalimages/dotnet AS build
 WORKDIR /src
-COPY *.csproj ./
-RUN dotnet restore
-COPY *.cs ./
+COPY nuget.config ./
+COPY GitLabPipelineAlertCenterBridge/*.csproj GitLabPipelineAlertCenterBridge/packages.lock.json ./
+RUN dotnet restore --locked-mode --configfile nuget.config
+COPY GitLabPipelineAlertCenterBridge/*.cs ./
 RUN dotnet publish -c Release --no-restore -o /app /p:UseAppHost=false
 
 FROM hub.aiursoft.com/aiursoft/internalimages/dotnetonlyruntime
