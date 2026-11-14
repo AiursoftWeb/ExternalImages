@@ -43,7 +43,7 @@ RUN install_dependencies() { \
 # at build time so ops can switch offline. The cached weights are device-agnostic
 # and app.py reloads them onto the GPU (WHISPERX_DEVICE=cuda) at runtime.
 COPY models_config.py bake_models.py /app/
-RUN python bake_models.py
+RUN HF_HUB_DISABLE_XET=1 python bake_models.py
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
