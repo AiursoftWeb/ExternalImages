@@ -121,6 +121,16 @@ deploy_cloudflare_analytics_collector:
         - .gitlab-ci.yml
         - CloudflareAnalyticsCollector/**/*
 
+test_whisperx:
+  stage: test
+  image: python:3.13-slim
+  script:
+    - python3 -m unittest discover -s WhisperX -p 'test_*.py' -v
+  rules:
+    - changes:
+        - .gitlab-ci.yml
+        - WhisperX/**/*
+
 test_clickhouse_app_log_error_monitor:
   stage: test
   image: python:3.13-slim
