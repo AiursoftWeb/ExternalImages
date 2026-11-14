@@ -147,7 +147,7 @@ deploy_http_error_alert_center_bridge:
   variables:
     IMAGE_NAME: "http_error_alert_center_bridge"
     CONTEXT: "./HttpErrorAlertCenterBridge"
-    BUILD_ARGS: "--no-cache-filter install"
+    BUILD_ARGS: "--no-cache"
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
