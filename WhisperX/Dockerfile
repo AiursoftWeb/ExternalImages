@@ -21,19 +21,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN if [ "$USE_PYPI_MIRROR" = "true" ]; then \
-        PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple; \
+RUN install_dependencies() { \
+        pip install --index-url "$1" \
+            "fastapi==0.116.1" \
+            "uvicorn[standard]==0.35.0" \
+            "python-multipart==0.0.20" \
+            "av==13.1.0" \
+            "faster-whisper==1.2.1" \
+            "nvidia-cublas-cu12==12.8.4.1" \
+            "nvidia-cudnn-cu12==9.10.2.21"; \
+    }; \
+    if [ "$USE_PYPI_MIRROR" = "true" ]; then \
+        install_dependencies https://pypi.tuna.tsinghua.edu.cn/simple \
+        || { echo "Tsinghua PyPI installation failed; retrying with official PyPI." >&2; \
+             install_dependencies https://pypi.org/simple; }; \
     else \
-        PIP_INDEX_URL=https://pypi.org/simple; \
-    fi \
-    && pip install --index-url "$PIP_INDEX_URL" \
-        "fastapi==0.116.1" \
-        "uvicorn[standard]==0.35.0" \
-        "python-multipart==0.0.20" \
-        "av==13.1.0" \
-        "faster-whisper==1.2.1" \
-        "nvidia-cublas-cu12==12.8.4.1" \
-        "nvidia-cudnn-cu12==9.10.2.21"
+        install_dependencies https://pypi.org/simple; \
+    fi
 
 # Bake the curated model levels (models_config.BAKED_MODELS) into the image
 # at build time so ops can switch offline. The cached weights are device-agnostic
