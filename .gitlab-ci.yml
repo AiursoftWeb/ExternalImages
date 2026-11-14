@@ -91,7 +91,7 @@ deploy_whisperx:
     IMAGE_NAME: "whisperx"
     CONTEXT: "./WhisperX"
     PLATFORMS: "linux/amd64"
-    BUILD_ARGS: "--build-arg SINGLE_MODEL=true --build-arg USE_PYPI_MIRROR=true"
+    BUILD_ARGS: "--build-arg SINGLE_MODEL=true --build-arg USE_PYPI_MIRROR=false"
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
