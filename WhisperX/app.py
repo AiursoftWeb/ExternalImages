@@ -1,4 +1,6 @@
 import atexit
+import asyncio
+from contextlib import asynccontextmanager
 import multiprocessing
 import os
 import queue
@@ -9,12 +11,25 @@ import threading
 import time
 
 from faster_whisper import WhisperModel
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from models_config import BAKED_MODELS, ensure_baked_model
 
-app = FastAPI()
+PRELOAD_ENABLED = os.getenv("WHISPERX_PRELOAD", "false").lower() == "true"
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    try:
+        if PRELOAD_ENABLED:
+            await asyncio.to_thread(inference_process.preload)
+        yield
+    finally:
+        inference_process.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 model_token = os.getenv("ASR_WHISPERX_TOKEN", "").strip()
 if not model_token:
     raise RuntimeError("ASR_WHISPERX_TOKEN is required")
@@ -30,6 +45,10 @@ class TranscriptionCancelled(Exception):
 
 
 class TranscriptionBusy(Exception):
+    pass
+
+
+class TranscriptionUnavailable(Exception):
     pass
 
 
@@ -81,6 +100,14 @@ def inference_worker(command_queue, result_queue):
                 "status": "model_loaded",
                 "model": command["model"],
             })
+            if command.get("operation") == "preload":
+                result_queue.put({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "model": command["model"],
+                    "payload": None,
+                })
+                continue
             segments_iter, info = model.transcribe(
                 command["audio_path"],
                 language=command["language"] or None,
@@ -134,8 +161,23 @@ class InferenceProcess:
         self.loaded_model = None
         self.cancelled_task_ids = {}
 
+    def preload(self):
+        return self._execute({
+            "operation": "preload",
+            "model": os.getenv("WHISPERX_MODEL", "large-v3"),
+        }, wait=True)
+
     def transcribe(self, task_id, audio_path, model, language, response_format):
-        if not self.run_lock.acquire(blocking=False):
+        return self._execute({
+            "task_id": task_id,
+            "audio_path": audio_path,
+            "model": model,
+            "language": language,
+            "response_format": response_format,
+        })
+
+    def _execute(self, command, wait=False):
+        if not self.run_lock.acquire(blocking=wait):
             raise TranscriptionBusy("another transcription is already running")
 
         task_done = None
@@ -144,14 +186,10 @@ class InferenceProcess:
         generation = None
         cancelled = False
         try:
-            task_id, generation, command_queue, result_queue, task_done = self._prepare_task(task_id)
-            command_queue.put({
-                "task_id": task_id,
-                "audio_path": audio_path,
-                "model": model,
-                "language": language,
-                "response_format": response_format,
-            })
+            task_id, generation, command_queue, result_queue, task_done = self._prepare_task(
+                command.get("task_id"), preload=command.get("operation") == "preload"
+            )
+            command_queue.put({**command, "task_id": task_id})
             result = self._wait_for_result(task_id, generation, result_queue)
         finally:
             if generation is not None:
@@ -215,12 +253,16 @@ class InferenceProcess:
                 return []
             return [self.loaded_model]
 
-    def _prepare_task(self, task_id=None):
+    def _prepare_task(self, task_id=None, preload=False):
         with self.state_lock:
             task_id = task_id or secrets.token_hex(16)
             self._prune_cancelled_tasks()
             if task_id in self.cancelled_task_ids:
                 raise TranscriptionCancelled("transcription was cancelled before execution")
+            if PRELOAD_ENABLED and not preload and (
+                self.process is None or not self.process.is_alive() or self.loaded_model is None
+            ):
+                raise TranscriptionUnavailable("the resident model is not ready")
             if self.process is None or not self.process.is_alive():
                 self._start_process()
             self.active_task_id = task_id
@@ -321,7 +363,10 @@ async def require_model_token(request: Request, call_next):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_loaded": inference_process.loaded_models()}
+    loaded = inference_process.loaded_models()
+    if PRELOAD_ENABLED and not loaded:
+        return JSONResponse(status_code=503, content={"status": "loading", "models_loaded": []})
+    return {"status": "ok", "models_loaded": loaded}
 
 
 @app.get("/v1/models")
@@ -340,10 +385,12 @@ def list_models():
 
 
 @app.post("/v1/cancel")
-def cancel(x_task_id: str = Header(default="", alias="X-Task-Id")):
+def cancel(background_tasks: BackgroundTasks, x_task_id: str = Header(default="", alias="X-Task-Id")):
     if not x_task_id:
         raise HTTPException(status_code=400, detail="task ID is required")
     status = inference_process.cancel(x_task_id)
+    if PRELOAD_ENABLED and status == "cancelled":
+        background_tasks.add_task(inference_process.preload)
     status_code = 200 if status == "cancelled" else 202
     return JSONResponse(
         status_code=status_code,
@@ -381,6 +428,8 @@ def transcribe(
             )
         except TranscriptionBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TranscriptionUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except TranscriptionCancelled as exc:
             raise HTTPException(status_code=499, detail=str(exc)) from exc
         except ValueError as exc:
