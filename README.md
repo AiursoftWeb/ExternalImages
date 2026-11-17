@@ -26,20 +26,20 @@ The catalog below describes the configured release jobs, not a live registry ava
 
 ### Image catalog
 
-The release jobs in [`.gitlab-ci.yml`](.gitlab-ci.yml) define these image names and build platforms:
+The release jobs in [`.gitlab-ci.yml`](.gitlab-ci.yml) define these image names and build platforms. Image links open the corresponding build-context Dockerfile; all platforms below are Linux:
 
-| Build context | Image name | CI platforms | Purpose |
-| --- | --- | --- | --- |
-| [Gateway](Gateway/Dockerfile) | `gateway` | `linux/amd64,linux/arm64` | Xray gateway with runtime client UUID configuration. |
-| [AsrApi](AsrApi/Dockerfile) | `asr-api` | `linux/amd64,linux/arm64` | Go speech API and embedded web frontend. |
-| [FolderAgent](FolderAgent/Dockerfile) | `folderagent` | `linux/amd64,linux/arm64` | Folder-scoped AI agent service; persistent workspace and provider authentication. |
-| [MarkItDown](MarkItDown/Dockerfile) | `markitdown` | `linux/amd64,linux/arm64` | HTTP file-to-Markdown conversion service. |
-| [WhisperX](WhisperX/Dockerfile) | `whisperx` | `linux/amd64` | CUDA transcription service with models baked into the image. |
-| [GitLabPipelineAlertCenterBridge](GitLabPipelineAlertCenterBridge/Dockerfile) | `gitlab_pipeline_alert_center_bridge` | `linux/amd64,linux/arm64` | PipelineWatchDog Global Tool wrapper for GitLab-to-AlertCenter alerts. |
-| [CloudflareAnalyticsCollector](CloudflareAnalyticsCollector/Dockerfile) | `cloudflare_analytics_collector` | `linux/amd64,linux/arm64` | Cloudflare analytics collection into ClickHouse. |
-| [ClickHouseAppLogErrorMonitor](ClickHouseAppLogErrorMonitor/Dockerfile) | `clickhouse_app_log_error_monitor` | `linux/amd64,linux/arm64` | ClickHouse application-error monitoring and alert delivery. |
-| [HttpErrorAlertCenterBridge](HttpErrorAlertCenterBridge/Dockerfile) | `http_error_alert_center_bridge` | `linux/amd64,linux/arm64` | LogWatchDog Global Tool wrapper for HTTP error alerts. |
-| [Shepherd140Fixed](Shepherd140Fixed/Dockerfile) | `shepherd-140fixed` | `linux/amd64,linux/arm64` | Shepherd image with the tracked #140 patch applied. |
+| Image | CI platforms | Purpose |
+| --- | --- | --- |
+| [`gateway`](Gateway/Dockerfile) | amd64, arm64 | Xray gateway with runtime client UUID configuration. |
+| [`asr-api`](AsrApi/Dockerfile) | amd64, arm64 | Go speech API and embedded web frontend. |
+| [`folderagent`](FolderAgent/Dockerfile) | amd64, arm64 | Folder-scoped AI agent service; persistent workspace and provider authentication. |
+| [`markitdown`](MarkItDown/Dockerfile) | amd64, arm64 | HTTP file-to-Markdown conversion service. |
+| [`whisperx`](WhisperX/Dockerfile) | amd64 | CUDA transcription service with models baked into the image. |
+| [`gitlab_pipeline_alert_center_bridge`](GitLabPipelineAlertCenterBridge/Dockerfile) | amd64, arm64 | PipelineWatchDog Global Tool wrapper for GitLab-to-AlertCenter alerts. |
+| [`cloudflare_analytics_collector`](CloudflareAnalyticsCollector/Dockerfile) | amd64, arm64 | Cloudflare analytics collection into ClickHouse. |
+| [`clickhouse_app_log_error_monitor`](ClickHouseAppLogErrorMonitor/Dockerfile) | amd64, arm64 | ClickHouse application-error monitoring and alert delivery. |
+| [`http_error_alert_center_bridge`](HttpErrorAlertCenterBridge/Dockerfile) | amd64, arm64 | LogWatchDog Global Tool wrapper for HTTP error alerts. |
+| [`shepherd-140fixed`](Shepherd140Fixed/Dockerfile) | amd64, arm64 | Shepherd image with the tracked #140 patch applied. |
 
 ### Run an image
 
