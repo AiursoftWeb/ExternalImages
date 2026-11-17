@@ -101,18 +101,6 @@ deploy_whisperx:
         - .gitlab-ci.yml
         - WhisperX/**/*
 
-deploy_gitlab_pipeline_alert_center_bridge:
-  extends: .deploy_template
-  variables:
-    IMAGE_NAME: "gitlab_pipeline_alert_center_bridge"
-    CONTEXT: "./GitLabPipelineAlertCenterBridge"
-    BUILD_ARGS: "--no-cache-filter install"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "master"'
-      changes:
-        - .gitlab-ci.yml
-        - GitLabPipelineAlertCenterBridge/**/*
-
 deploy_cloudflare_analytics_collector:
   extends: .deploy_template
   variables:
