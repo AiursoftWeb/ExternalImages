@@ -10,6 +10,8 @@ workflow:
     - if: '$CI_COMMIT_BRANCH'
 
 variables:
+  npm_config_registry: "https://nopkg.aiursoft.com/npm/"
+  npm_config_replace_registry_host: "always"
   S360_PURPOSE: review
   S360_CHECK_KEY: ""
 
@@ -57,6 +59,7 @@ deploy_asr_api:
   variables:
     IMAGE_NAME: "asr-api"
     CONTEXT: "./AsrApi"
+    BUILD_ARGS: "--build-arg NPM_REGISTRY=$npm_config_registry"
   rules:
     - if: '$CI_COMMIT_BRANCH == "master"'
       changes:
@@ -179,9 +182,9 @@ s360_npm:
   stage: s360
   before_script:
     - export PATH="$PATH:$HOME/.dotnet/tools"
-    - dotnet tool update Aiursoft.S360.Client --global --add-source https://nuget.aiursoft.com/v3/index.json
+    - dotnet tool update --global Aiursoft.S360.Client --source https://nupkg.aiursoft.com/v3/index.json
   script:
-    - s360 check --path AsrApi/web --ecosystem npm --npm-lockfile-only --purpose "$S360_PURPOSE"
+    - s360 check --path AsrApi/web --ecosystem npm --npm-lockfile-only --npm-registry "$npm_config_registry" --purpose "$S360_PURPOSE"
   retry:
     max: 2
     when: runner_system_failure

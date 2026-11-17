@@ -1,9 +1,10 @@
 FROM node:24-alpine AS web-build
 
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 WORKDIR /web
 
-COPY web/package.json web/package-lock.json ./
-RUN npm ci
+COPY web/package.json web/package-lock.json web/.npmrc ./
+RUN npm ci --registry "$NPM_REGISTRY"
 
 COPY web .
 RUN npm run build
