@@ -35,7 +35,6 @@ The release jobs in [`.gitlab-ci.yml`](.gitlab-ci.yml) define these image names 
 | [`folderagent`](FolderAgent/Dockerfile) | amd64, arm64 | Folder-scoped AI agent service; persistent workspace and provider authentication. |
 | [`markitdown`](MarkItDown/Dockerfile) | amd64, arm64 | HTTP file-to-Markdown conversion service. |
 | [`whisperx`](WhisperX/Dockerfile) | amd64 | CUDA transcription service with models baked into the image. |
-| [`gitlab_pipeline_alert_center_bridge`](GitLabPipelineAlertCenterBridge/Dockerfile) | amd64, arm64 | PipelineWatchDog Global Tool wrapper for GitLab-to-AlertCenter alerts. |
 | [`cloudflare_analytics_collector`](CloudflareAnalyticsCollector/Dockerfile) | amd64, arm64 | Cloudflare analytics collection into ClickHouse. |
 | [`clickhouse_app_log_error_monitor`](ClickHouseAppLogErrorMonitor/Dockerfile) | amd64, arm64 | ClickHouse application-error monitoring and alert delivery. |
 | [`http_error_alert_center_bridge`](HttpErrorAlertCenterBridge/Dockerfile) | amd64, arm64 | LogWatchDog Global Tool wrapper for HTTP error alerts. |
@@ -83,7 +82,6 @@ Other image-specific inputs are separate contracts:
 | `whisperx` | Required `ASR_WHISPERX_TOKEN`, model/device/compute settings and optional `WHISPERX_PRELOAD`; see [WhisperX](WhisperX/README.md), [runtime](WhisperX/app.py) and [model choices](WhisperX/models_config.py). |
 | `cloudflare_analytics_collector` | Cloudflare credentials, ClickHouse connection and polling interval; see [collector configuration](CloudflareAnalyticsCollector/README.md). |
 | `clickhouse_app_log_error_monitor` | ClickHouse access, alert delivery and writable state directory; see [monitor configuration](ClickHouseAppLogErrorMonitor/README.md). |
-| `gitlab_pipeline_alert_center_bridge` | PipelineWatchDog runtime environment and persistent `/data`; see the [configured tool wrapper](GitLabPipelineAlertCenterBridge/Dockerfile). |
 | `http_error_alert_center_bridge` | LogWatchDog runtime environment and persistent `/data`; see the [configured tool wrapper](HttpErrorAlertCenterBridge/Dockerfile). |
 | `shepherd-140fixed` | Inherits Shepherd's configuration; the [component guide](Shepherd140Fixed/README.md) explains the patch and required Docker/Swarm access. |
 
