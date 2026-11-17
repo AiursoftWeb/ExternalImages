@@ -143,18 +143,6 @@ deploy_clickhouse_app_log_error_monitor:
         - .gitlab-ci.yml
         - ClickHouseAppLogErrorMonitor/**/*
 
-deploy_http_error_alert_center_bridge:
-  extends: .deploy_template
-  variables:
-    IMAGE_NAME: "http_error_alert_center_bridge"
-    CONTEXT: "./HttpErrorAlertCenterBridge"
-    BUILD_ARGS: "--no-cache"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "master"'
-      changes:
-        - .gitlab-ci.yml
-        - HttpErrorAlertCenterBridge/**/*
-
 deploy_shepherd_140fixed:
   extends: .deploy_template
   variables:
