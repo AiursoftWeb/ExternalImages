@@ -34,7 +34,7 @@ USER 10001:10001
 EXPOSE 9863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9863/health', timeout=3)"
-CMD ["sh", "-ec", "if ! test -r \"$MODEL_WEIGHTS\" || ! test -s \"$MODEL_WEIGHTS\"; then echo 'Mount the readable scanner checkpoint at MODEL_WEIGHTS.' >&2; exit 1; fi; exec python -m uvicorn api:app --host 0.0.0.0 --port 9863 --workers 1"]
+CMD ["sh", "-ec", "if ! test -f \"$MODEL_WEIGHTS\" || ! test -r \"$MODEL_WEIGHTS\" || ! test -s \"$MODEL_WEIGHTS\"; then echo 'Mount the readable scanner checkpoint at MODEL_WEIGHTS.' >&2; exit 1; fi; exec python -m uvicorn api:app --host 0.0.0.0 --port 9863 --workers 1"]
 
 FROM runtime AS test
 USER root
