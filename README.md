@@ -34,6 +34,7 @@ The release jobs in [`.gitlab-ci.yml`](.gitlab-ci.yml) define these image names 
 | [`asr-api`](AsrApi/Dockerfile) | amd64, arm64 | Go speech API and embedded web frontend. |
 | [`folderagent`](FolderAgent/Dockerfile) | amd64, arm64 | Folder-scoped AI agent service; persistent workspace and provider authentication. |
 | [`markitdown`](MarkItDown/Dockerfile) | amd64, arm64 | HTTP file-to-Markdown conversion service. |
+| [`rms-scanner`](RmsScanner/README.md) | amd64 | Offline CPU enhancement of RMS curve photos. Mount the site checkpoint read-only and persist `/data`. |
 | [`whisperx`](WhisperX/Dockerfile) | amd64 | CUDA transcription service with models baked into the image. |
 | [`cloudflare_analytics_collector`](CloudflareAnalyticsCollector/Dockerfile) | amd64, arm64 | Cloudflare analytics collection into ClickHouse. |
 | [`clickhouse_app_log_error_monitor`](ClickHouseAppLogErrorMonitor/Dockerfile) | amd64, arm64 | ClickHouse application-error monitoring and alert delivery. |
