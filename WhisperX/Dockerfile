@@ -23,6 +23,8 @@ RUN apt-get update \
 
 RUN install_dependencies() { \
         pip install --index-url "$1" \
+            --timeout 120 \
+            --retries 5 \
             "fastapi==0.116.1" \
             "uvicorn[standard]==0.35.0" \
             "python-multipart==0.0.20" \
@@ -33,7 +35,11 @@ RUN install_dependencies() { \
     }; \
     if [ "$USE_PYPI_MIRROR" = "true" ]; then \
         install_dependencies https://pypi.tuna.tsinghua.edu.cn/simple \
-        || { echo "Tsinghua PyPI installation failed; retrying with official PyPI." >&2; \
+        || { echo "Tsinghua PyPI installation failed; retrying with Aliyun PyPI." >&2; \
+             install_dependencies https://mirrors.aliyun.com/pypi/simple/; } \
+        || { echo "Aliyun PyPI installation failed; retrying with Tencent PyPI." >&2; \
+             install_dependencies https://mirrors.cloud.tencent.com/pypi/simple/; } \
+        || { echo "Tencent PyPI installation failed; retrying with official PyPI." >&2; \
              install_dependencies https://pypi.org/simple; }; \
     else \
         install_dependencies https://pypi.org/simple; \
