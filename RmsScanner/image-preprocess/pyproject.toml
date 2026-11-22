@@ -1,0 +1,31 @@
+[project]
+name = "image-preprocess"
+version = "0.1.0"
+description = "Standalone image-to-PNG preprocessing for a local image pipeline"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pillow>=11,<13",
+]
+
+[project.scripts]
+image-preprocess = "image_preprocess.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/image_preprocess"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--basetemp=.pytest-work"
+
+[tool.ruff]
+line-length = 100
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]

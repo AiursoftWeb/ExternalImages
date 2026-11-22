@@ -1,0 +1,17 @@
+[project]
+name = "chart-enhance"
+version = "0.1.0"
+description = "Conservative chart rectification and enhancement"
+requires-python = ">=3.12,<3.13"
+dependencies = ["pillow>=11,<13", "numpy>=2,<3", "opencv-python-headless>=4.10,<5"]
+[project.scripts]
+chart-enhance = "chart_enhance.cli:main"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.9"]
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I"]

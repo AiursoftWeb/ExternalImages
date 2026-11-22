@@ -1,0 +1,48 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated images, diagnostics and shared API storage
+/output/
+/result/
+/result-*/
+/reproduced/
+/gentle/
+/clean/
+/plots/
+/fast/
+/data/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Logs, editors and OS files
+*.log
+.vscode/
+.idea/
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.validation/
+**/.venv/
+.pytest-work/
+
+*.h5
