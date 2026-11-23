@@ -162,6 +162,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(payload['Title'], '[node] app: 3 errors in 15 minutes')
                 self.assertIn('ExampleException: failure', text)
                 self.assertIn('ClickHouse query page: https://clickhouse.example.com/play', text)
+                self.assertEqual(payload.get('InvestigateUrl'), 'https://clickhouse.example.com/play')
                 self.assertIn('FROM `AspNetCoreLogs`.`app`', text)
             else:
                 text = json.loads(Mock.requests[-1][2])['Reason']
