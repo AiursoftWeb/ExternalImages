@@ -435,6 +435,8 @@ class Monitor:
             payload = {'ReportId': str(uuid.uuid4()), 'Title': (f'[{self.node}] {name}: {count} errors in 15 minutes')[:200],
                        'Content': diagnostic_text, 'Level': severity(count), 'Context': context,
                        'OccurredAtUtc': now.astimezone(UTC).isoformat(), 'Metadata': self.identity(name)}
+            if self.public_url:
+                payload['InvestigateUrl'] = f'{self.public_url}/play'
             self.store.save(name, payload)
             incident_id = self.api.create(payload)
             current = self.validate(self.api.get(incident_id), name)
